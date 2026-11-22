@@ -1,4 +1,4 @@
-//! Standard Xet CAS HTTP adapter. Repository authentication is out of scope.
+//! Standard Xet CAS HTTP adapter. Repository authentication is out of scope
 
 const std = @import("std");
 const hashing = @import("hash.zig");
@@ -7,6 +7,7 @@ const shard = @import("shard.zig");
 const xorb = @import("xorb.zig");
 const storage = @import("store.zig");
 const stream = @import("stream.zig");
+const dedup = @import("dedup.zig");
 
 const transfer_buffer_size = stream.scratch_buffer_size;
 
@@ -29,11 +30,11 @@ pub const Client = struct {
     endpoint: []u8,
     access_token: []u8,
     http_client: std.http.Client,
-    /// A 404/501 response selects V1 for later calls.
+    /// 404/501 responses select V1 for later calls
     reconstruction_version: std.atomic.Value(u8) = .init(2),
     shard_version: std.atomic.Value(u8) = .init(2),
 
-    /// Accepts either a CAS origin or an endpoint ending in `/v1` or `/v2`.
+    /// Accepts a CAS origin or an endpoint ending in `/v1` or `/v2`
     pub fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -76,13 +77,26 @@ pub const Client = struct {
         input: []const u8,
         options: storage.PackOptions,
     ) !storage.PublishResult {
-        var publisher = try storage.Publisher.init(allocator, self.store(), options);
+        var global = GlobalDedup{
+            .client = self,
+            .allocator = self.allocator,
+            .io = self.http_client.io,
+            .index = .init(allocator),
+        };
+        defer global.deinit();
+        var opts = storage.PublisherOptions.fromPackOptions(options);
+        opts.dedup_source = global.source();
+        opts.new_xorb_listener = .{
+            .context = &global,
+            .callback = GlobalDedup.addXorb,
+        };
+        var publisher = try storage.Publisher.init(allocator, self.store(), opts);
         defer publisher.deinit();
         try publisher.write(input);
         return publisher.finish();
     }
 
-    /// Download and verify a complete file. The caller owns the returned bytes.
+    /// Downloads and verifies a file. The caller owns the returned bytes
     pub fn download(
         self: *Client,
         allocator: std.mem.Allocator,
@@ -144,7 +158,7 @@ pub const Client = struct {
     fn request(
         self: *Client,
         method: std.http.Method,
-        request_url: []const u8,
+        target: []const u8,
         body: ?[]const u8,
         authenticated: bool,
         range: ?reconstruction.ByteRange,
@@ -169,7 +183,7 @@ pub const Client = struct {
             headers[count] = .{ .name = "Range", .value = value };
             count += 1;
         }
-        const uri = try std.Uri.parse(request_url);
+        const uri = try std.Uri.parse(target);
         var req = try self.http_client.request(method, uri, .{
             .extra_headers = headers[0..count],
             .headers = .{
@@ -205,9 +219,9 @@ pub const Client = struct {
         const hex = hashing.toHex(file_hash);
         var version = self.reconstruction_version.load(.monotonic);
         while (true) {
-            const request_url = try self.url("/v{d}/reconstructions/{s}", .{ version, hex });
-            defer self.allocator.free(request_url);
-            var req = try self.request(.GET, request_url, null, true, range, false);
+            const target = try self.url("/v{d}/reconstructions/{s}", .{ version, hex });
+            defer self.allocator.free(target);
+            var req = try self.request(.GET, target, null, true, range, false);
             defer req.deinit();
             var response = try req.receiveHead(&.{});
             if (response.head.status != .ok) {
@@ -229,20 +243,19 @@ pub const Client = struct {
 
     pub fn putXorb(self: *Client, hash: hashing.Hash, bytes: []const u8) !void {
         const hex = hashing.toHex(hash);
-        const request_url = try self.url("/v1/xorbs/default/{s}", .{hex});
-        defer self.allocator.free(request_url);
+        const target = try self.url("/v1/xorbs/default/{s}", .{hex});
+        defer self.allocator.free(target);
         const upload_bytes = if (xorb.parseFooter(bytes)) |footer|
             bytes[0..footer.body_length]
         else |_|
             bytes;
-        var req = try self.request(.POST, request_url, upload_bytes, true, null, false);
+        var req = try self.request(.POST, target, upload_bytes, true, null, false);
         defer req.deinit();
         var response = try req.receiveHead(&.{});
         if (response.head.status != .ok) return statusError(response.head.status);
         const body = try readResponse(self.allocator, &response, 64 * 1024);
         defer self.allocator.free(body);
-        // A successful status is authoritative; the optional was_inserted flag
-        // only reports deduplication and does not change publication semantics.
+        // Success is authoritative. was_inserted only reports deduplication
     }
 
     pub fn putShard(self: *Client, bytes: []const u8) !void {
@@ -260,9 +273,9 @@ pub const Client = struct {
 
         var version = self.shard_version.load(.monotonic);
         while (true) {
-            const request_url = try self.url("/v{d}/shards", .{version});
-            defer self.allocator.free(request_url);
-            var req = try self.request(.POST, request_url, upload_bytes, true, null, true);
+            const target = try self.url("/v{d}/shards", .{version});
+            defer self.allocator.free(target);
+            var req = try self.request(.POST, target, upload_bytes, true, null, true);
             defer req.deinit();
             var response = try req.receiveHead(&.{});
             if (response.head.status != .ok) {
@@ -281,6 +294,65 @@ pub const Client = struct {
             self.shard_version.store(version, .release);
             return;
         }
+    }
+};
+
+const GlobalDedup = struct {
+    client: *Client,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    index: dedup.SessionIndex,
+
+    fn deinit(self: *GlobalDedup) void {
+        self.index.deinit();
+    }
+
+    fn source(self: *GlobalDedup) storage.DedupSource {
+        return .{ .context = self, .query_fn = query };
+    }
+
+    fn addXorb(raw: *anyopaque, item: shard.Xorb) !void {
+        const self: *GlobalDedup = @ptrCast(@alignCast(raw));
+        try self.index.addXorb(item);
+    }
+
+    fn query(raw: *anyopaque, alloc: std.mem.Allocator, hashes: []const hashing.Hash) !?dedup.Match {
+        const self: *GlobalDedup = @ptrCast(@alignCast(raw));
+        const local = self.index.source();
+        if (try local.query(alloc, hashes)) |match| return match;
+        const bytes = self.fetch(alloc, hashes[0]) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => null,
+        };
+        if (bytes) |owned| {
+            const now = std.Io.Clock.real.now(self.io).nanoseconds;
+            const secs = @divFloor(now, std.time.ns_per_s);
+            _ = self.index.addGlobalOwned(owned, @intCast(secs)) catch |err| switch (err) {
+                error.OutOfMemory => {
+                    alloc.free(owned);
+                    return err;
+                },
+                else => false,
+            };
+        }
+        return local.query(alloc, hashes) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => null,
+        };
+    }
+
+    fn fetch(self: *GlobalDedup, alloc: std.mem.Allocator, hash: hashing.Hash) !?[]u8 {
+        const hex = hashing.toHex(hash);
+        const target = try self.client.url("/v1/chunks/default-merkledb/{s}", .{hex});
+        defer self.allocator.free(target);
+        var req = try self.client.request(.GET, target, null, true, null, true);
+        defer req.deinit();
+        var response = try req.receiveHead(&.{});
+        if (response.head.status == .not_found) return null;
+        if (response.head.status != .ok) return statusError(response.head.status);
+        const bytes = try Client.readResponse(alloc, &response, 80 * 1024 * 1024);
+        errdefer alloc.free(bytes);
+        return bytes;
     }
 };
 
@@ -472,11 +544,11 @@ fn parsePlan(
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
     defer parsed.deinit();
     const root = try object(parsed.value);
-    const term_values = try array(try field(root, "terms"));
+    const terms = try array(try field(root, "terms"));
     var plan = reconstruction.Plan{ .terms = &.{}, .locations = &.{} };
     errdefer plan.deinit(allocator);
-    plan.terms = try allocator.alloc(reconstruction.Term, term_values.items.len);
-    for (term_values.items, plan.terms) |value, *term| {
+    plan.terms = try allocator.alloc(reconstruction.Term, terms.items.len);
+    for (terms.items, plan.terms) |value, *term| {
         const item = try object(value);
         term.* = .{
             .hash = hashing.fromHex(try string(item, "hash")) catch return error.InvalidResponse,
@@ -485,25 +557,25 @@ fn parsePlan(
         };
     }
 
-    const fetch_values = try object(try field(root, if (version == 2) "xorbs" else "fetch_info"));
-    var location_count: usize = 0;
-    var iterator = fetch_values.iterator();
+    const fetches = try object(try field(root, if (version == 2) "xorbs" else "fetch_info"));
+    var count: usize = 0;
+    var iterator = fetches.iterator();
     while (iterator.next()) |entry| {
         const values = try array(entry.value_ptr.*);
         if (version == 2) {
             for (values.items) |value| {
                 const ranges = try array(try field(try object(value), "ranges"));
-                location_count = std.math.add(usize, location_count, ranges.items.len) catch
+                count = std.math.add(usize, count, ranges.items.len) catch
                     return error.InvalidResponse;
             }
         } else {
-            location_count = std.math.add(usize, location_count, values.items.len) catch
+            count = std.math.add(usize, count, values.items.len) catch
                 return error.InvalidResponse;
         }
     }
-    plan.locations = try allocator.alloc(reconstruction.Location, location_count);
+    plan.locations = try allocator.alloc(reconstruction.Location, count);
     for (plan.locations) |*location| location.url = "";
-    iterator = fetch_values.iterator();
+    iterator = fetches.iterator();
     var index: usize = 0;
     while (iterator.next()) |entry| {
         const hash = hashing.fromHex(entry.key_ptr.*) catch return error.InvalidResponse;

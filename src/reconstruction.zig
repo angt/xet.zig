@@ -1,4 +1,4 @@
-//! File reconstruction through caller-provided Xorb retrieval.
+//! File reconstruction through caller-provided Xorb retrieval
 
 const std = @import("std");
 const constants = @import("constants.zig");
@@ -19,14 +19,14 @@ pub const Term = struct {
     range: Range,
 };
 
-/// Inclusive HTTP-style byte range, matching the CAS reconstruction response.
+/// Inclusive HTTP-style byte range, matching the CAS reconstruction response
 pub const ByteRange = stream.ByteRange;
 
 pub const Location = struct {
     hash: hashing.Hash,
     range: Range,
     url: []const u8,
-    /// Null means the complete object; used when a shard records no encoded size.
+    /// Null requests the complete object
     byte_range: ?ByteRange,
 };
 
@@ -35,7 +35,7 @@ pub const Plan = struct {
     locations: []Location,
     offset_into_first_range: u64 = 0,
     output_length: ?u64 = null,
-    /// Expected identity for complete-file verification; output ranges are unsupported.
+    /// Enables complete-file verification. Ranged output is unsupported
     file_hash: ?hashing.Hash = null,
 
     pub fn init(
@@ -97,7 +97,7 @@ pub const Error = error{
     SizeMismatch,
 };
 
-/// Reconstruct into a caller-owned buffer and return its initialized prefix.
+/// Returns the initialized prefix of the caller-owned output
 pub fn reconstructInto(
     allocator: std.mem.Allocator,
     output: []u8,
@@ -109,7 +109,7 @@ pub fn reconstructInto(
     return writer.buffered();
 }
 
-/// Allocate and reconstruct a complete plan (or its explicitly sized range).
+/// Returns an allocated reconstruction of the plan or requested range
 pub fn reconstruct(allocator: std.mem.Allocator, plan: *const Plan, opener: Opener) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
@@ -117,8 +117,7 @@ pub fn reconstruct(allocator: std.mem.Allocator, plan: *const Plan, opener: Open
     return output.toOwnedSlice();
 }
 
-/// Reconstruct using incremental transport and chunk decoding, without
-/// buffering a complete encoded range or decoded term.
+/// Streams reconstruction without buffering a complete encoded range or term
 pub fn consume(
     allocator: std.mem.Allocator,
     plan: *const Plan,
@@ -239,9 +238,7 @@ pub const ShardPlan = struct {
     }
 };
 
-/// Validate one file entry in a shard, including its Merkle root and optional
-/// segment verification records. With a null hash, the shard must contain one
-/// file and its hash is returned.
+/// Validates file hashes and verification records. Null requires one file in the shard
 pub fn validateShardFile(
     allocator: std.mem.Allocator,
     bytes: []const u8,
@@ -286,9 +283,7 @@ pub fn validateShardFile(
     return info.hash;
 }
 
-/// Build a verified, whole-file reconstruction plan from shard metadata. Each
-/// location requests the complete serialized Xorb; the URL is left for the
-/// transport to fill in when constructing a custom plan.
+/// Builds a verified whole-file plan using complete Xorbs and empty transport URLs
 pub fn planFromShard(
     allocator: std.mem.Allocator,
     bytes: []const u8,
@@ -343,8 +338,7 @@ pub fn planFromShard(
     return .{ .size = size, .plan = plan, .chunks = chunks };
 }
 
-/// Verify each canonical chunk before forwarding it. A null sink only verifies.
-/// Retains one chunk in addition to decoder buffers; rejects ranged plans.
+/// Verifies whole plans before forwarding with one retained chunk and an optional sink
 pub fn consumeVerified(
     allocator: std.mem.Allocator,
     plan: *const Plan,

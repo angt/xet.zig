@@ -1,4 +1,4 @@
-//! MDB shard V2 files: reconstruction records and lookup tables.
+//! MDB shard V2 files: reconstruction records and lookup tables
 
 const std = @import("std");
 const hashing = @import("hash.zig");
@@ -161,7 +161,7 @@ fn chunkLess(_: void, a: ChunkLocation, b: ChunkLocation) bool {
     return hashing.truncated(a.hash) < hashing.truncated(b.hash);
 }
 
-/// Serialize a deterministic, unkeyed shard. Inputs are sorted internally.
+/// Serialize a deterministic, unkeyed shard. Inputs are sorted internally
 pub fn serialize(
     allocator: std.mem.Allocator,
     files_input: []const File,
@@ -262,7 +262,7 @@ pub fn serialize(
         for (file.segments) |segment| materialized += segment.unpacked_segment_bytes;
     }
 
-    // Footer fields are written explicitly to avoid host-layout dependencies.
+    // Write footer fields explicitly to avoid host-layout dependencies
     try putU64(&output, allocator, 1);
     try putU64(&output, allocator, header_size);
     try putU64(&output, allocator, xorb_info_offset);
@@ -272,9 +272,9 @@ pub fn serialize(
     try putU64(&output, allocator, xorbs.len);
     try putU64(&output, allocator, chunk_lookup_offset);
     try putU64(&output, allocator, chunk_locations.len);
-    try output.appendNTimes(allocator, 0, 32); // No HMAC key.
-    try putU64(&output, allocator, 0); // Creation timestamp.
-    try putU64(&output, allocator, std.math.maxInt(u64)); // No expiry.
+    try output.appendNTimes(allocator, 0, 32); // No HMAC key
+    try putU64(&output, allocator, 0); // Creation timestamp
+    try putU64(&output, allocator, std.math.maxInt(u64)); // No expiry
     try output.appendNTimes(allocator, 0, 48);
     try putU64(&output, allocator, stored_on_disk);
     try putU64(&output, allocator, materialized);

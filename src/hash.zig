@@ -1,12 +1,12 @@
 const std = @import("std");
 const constants = @import("constants.zig");
 
-/// A Xet hash in its binary, little-endian-word representation.
+/// A Xet hash in its binary, little-endian-word representation
 pub const Hash = [32]u8;
 
 pub const zero: Hash = @splat(0);
 
-/// Convert a conventional big-endian digest to Xet's little-endian u64 words.
+/// Converts a big-endian digest to Xet's little-endian u64 words
 pub fn fromStandard(digest: [32]u8) Hash {
     var out: Hash = undefined;
     for (0..4) |word| {
@@ -26,12 +26,12 @@ pub fn keyed(key: Hash, message: []const u8) Hash {
     return out;
 }
 
-pub fn data(data_bytes: []const u8) Hash {
-    return keyed(constants.data_key, data_bytes);
+pub fn data(bytes: []const u8) Hash {
+    return keyed(constants.data_key, bytes);
 }
 
-pub fn internal(data_bytes: []const u8) Hash {
-    return keyed(constants.internal_node_key, data_bytes);
+pub fn internal(bytes: []const u8) Hash {
+    return keyed(constants.internal_node_key, bytes);
 }
 
 pub fn verification(hashes: []const Hash) Hash {
@@ -50,7 +50,7 @@ pub fn verificationNodes(nodes: []const Node) Hash {
     return out;
 }
 
-/// Convert to the API representation: four little-endian u64 words in hex.
+/// Formats four little-endian u64 words as hexadecimal
 pub fn toHex(value: Hash) [64]u8 {
     const hex = "0123456789abcdef";
     var out: [64]u8 = undefined;
@@ -118,7 +118,7 @@ fn merge(nodes: []const Node) Node {
     return .{ .hash = internal(stream.buffered()), .size = total };
 }
 
-/// Aggregate chunk nodes using Xet's content-defined Merkle tree.
+/// Aggregate chunk nodes using Xet's content-defined Merkle tree
 pub fn aggregate(allocator: std.mem.Allocator, nodes: []const Node) !Hash {
     if (nodes.len == 0) return zero;
     if (nodes.len == 1) return nodes[0].hash;
@@ -127,15 +127,15 @@ pub fn aggregate(allocator: std.mem.Allocator, nodes: []const Node) !Hash {
     defer allocator.free(work);
     var len = work.len;
     while (len > 1) {
-        var read_index: usize = 0;
-        var write_index: usize = 0;
-        while (read_index < len) {
-            const end = read_index + nextCut(work[read_index..len]);
-            work[write_index] = merge(work[read_index..end]);
-            read_index = end;
-            write_index += 1;
+        var src: usize = 0;
+        var dst: usize = 0;
+        while (src < len) {
+            const end = src + nextCut(work[src..len]);
+            work[dst] = merge(work[src..end]);
+            src = end;
+            dst += 1;
         }
-        len = write_index;
+        len = dst;
     }
     return work[0].hash;
 }
@@ -150,7 +150,7 @@ pub fn file(allocator: std.mem.Allocator, nodes: []const Node) !Hash {
     return keyed(zero, &root);
 }
 
-/// Bounded-memory Xet Merkle aggregation.
+/// Bounded-memory Xet Merkle aggregation
 pub const Aggregator = struct {
     levels: [max_levels]Level = @splat(.{}),
     leaves: u64 = 0,
@@ -192,20 +192,20 @@ pub const Aggregator = struct {
     fn rootMut(self: *Aggregator) !Hash {
         if (self.leaves == 0) return zero;
         if (self.leaves == 1) return self.levels[0].nodes[0].hash;
-        for (0..max_levels) |index| {
-            const level = &self.levels[index];
+        for (0..max_levels) |i| {
+            const level = &self.levels[i];
             if (level.len == 0) continue;
             var higher = false;
-            for (self.levels[index + 1 ..]) |other| {
+            for (self.levels[i + 1 ..]) |other| {
                 if (other.len != 0) higher = true;
             }
             if (level.len == 1 and !higher) return level.nodes[0].hash;
 
-            var position: usize = 0;
-            while (position < level.len) {
-                const cut = nextCut(level.nodes[position..level.len]);
-                try self.addAt(index + 1, merge(level.nodes[position..][0..cut]));
-                position += cut;
+            var pos: usize = 0;
+            while (pos < level.len) {
+                const cut = nextCut(level.nodes[pos..level.len]);
+                try self.addAt(i + 1, merge(level.nodes[pos..][0..cut]));
+                pos += cut;
             }
             level.len = 0;
         }

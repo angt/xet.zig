@@ -1,4 +1,4 @@
-//! Transport requests and lifecycle around standard Zig incremental readers.
+//! Transport requests and lifecycle around standard Zig incremental readers
 
 const std = @import("std");
 const hashing = @import("hash.zig");
@@ -18,11 +18,11 @@ pub fn rangeLength(range: ByteRange) error{InvalidRange}!u64 {
 pub const Request = struct {
     hash: hashing.Hash,
     url: []const u8,
-    /// Null requests the complete object.
+    /// Null requests the complete object
     byte_range: ?ByteRange,
 };
 
-/// Returned readers are owned by the opener and must not outlive `close`.
+/// Returned readers are owned by the opener and must not outlive `close`
 pub const Opener = struct {
     context: *anyopaque,
     open_fn: *const fn (context: *anyopaque, request: Request) anyerror!*std.Io.Reader,

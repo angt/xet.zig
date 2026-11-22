@@ -2,7 +2,7 @@ const std = @import("std");
 const hashing = @import("hash.zig");
 const chunker = @import("chunker.zig");
 
-/// Recomputes a complete file identity while optionally passing bytes through.
+/// Recomputes a complete file identity while optionally passing bytes through
 pub const Verifier = struct {
     allocator: std.mem.Allocator,
     chunker: chunker.Chunker,
