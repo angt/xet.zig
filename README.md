@@ -19,7 +19,7 @@ pub fn roundTrip(
 
     const uploaded = try cas.upload(allocator, "Hello, Xet!", .{});
 
-    // Downloads the complete file, verifies it, and returns caller-owned bytes.
+    // Downloads the complete file, verifies it, and returns caller-owned bytes
     const downloaded = try cas.download(allocator, uploaded.file_hash);
     defer allocator.free(downloaded);
 }

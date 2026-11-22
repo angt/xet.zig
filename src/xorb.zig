@@ -1,4 +1,4 @@
-//! Xorb chunk streams and V1 object footers.
+//! Xorb chunk streams and V1 object footers
 
 const std = @import("std");
 const constants = @import("constants.zig");
@@ -135,7 +135,7 @@ fn footerLength(chunk_count: usize) u32 {
     return @intCast(92 + 40 * chunk_count);
 }
 
-/// Incrementally encode a Xorb. Chunk data is borrowed only for each `add` call.
+/// Borrows chunk data only during `add`
 pub const Serializer = struct {
     compression: Compression,
     output: std.ArrayList(u8) = .empty,
@@ -247,7 +247,7 @@ pub const Serializer = struct {
     }
 };
 
-/// Serialize chunks with a V1 footer. Inputs are borrowed only for this call.
+/// Writes a V1 footer. Inputs are borrowed only for this call
 pub fn serialize(
     allocator: std.mem.Allocator,
     chunks: []const Chunk,
@@ -305,7 +305,7 @@ pub const Decoded = struct {
     }
 };
 
-/// Decode a complete Xorb or a raw range of chunk-stream records.
+/// Decode a complete Xorb or a raw range of chunk-stream records
 pub fn decodeRange(
     allocator: std.mem.Allocator,
     input: []const u8,
@@ -386,8 +386,7 @@ fn discardExact(source: *std.Io.Reader, count: usize) !void {
     };
 }
 
-/// Decode a chunk range incrementally. At most one compressed chunk and one
-/// decompressed chunk are retained; skipped chunks are discarded, not buffered.
+/// Discards skipped chunks and retains one compressed and one decompressed chunk
 pub fn decodeStream(
     allocator: std.mem.Allocator,
     source: *std.Io.Reader,
@@ -449,14 +448,14 @@ pub fn decodeStream(
     return total;
 }
 
-/// Verify a complete V1 Xorb and bind it to the caller's expected object hash.
+/// Verifies a complete V1 Xorb against the expected object hash
 pub fn verifyHash(allocator: std.mem.Allocator, input: []const u8, expected: hashing.Hash) !void {
     const footer = try parseFooter(input);
     if (!hashing.eql(expected, footer.hash)) return error.HashMismatch;
     return verify(allocator, input);
 }
 
-/// Verify all chunks, footer metadata, and the object hash of a complete V1 Xorb.
+/// Verifies chunks, footer metadata, and object hash
 pub fn verify(allocator: std.mem.Allocator, input: []const u8) !void {
     const footer = try parseFooter(input);
     const info_length = std.mem.readInt(u32, input[input.len - 4 ..][0..4], .little);

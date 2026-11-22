@@ -12,8 +12,7 @@ pub const Result = struct {
     consumed: usize,
 };
 
-/// Returned chunks borrow input or internal storage until the next call to
-/// `next`, `reset`, or `deinit`.
+/// Chunks borrow input or internal storage until `next`, `reset`, or `deinit`
 pub const Chunker = struct {
     pending: std.ArrayList(u8),
     hash: u64 = 0,
@@ -33,7 +32,7 @@ pub const Chunker = struct {
         self.returned_pending = false;
     }
 
-    /// Set `final` only when no later input belongs to the same file.
+    /// Set `final` only when no later input belongs to the same file
     pub fn next(self: *Chunker, allocator: std.mem.Allocator, input: []const u8, final: bool) !Result {
         if (self.returned_pending) {
             self.pending.clearRetainingCapacity();
@@ -106,7 +105,7 @@ pub const Chunker = struct {
     }
 };
 
-/// Chunk a contiguous input. All returned data slices borrow `input`.
+/// Returned data slices borrow `input`
 pub fn chunkBuffer(allocator: std.mem.Allocator, input: []const u8) ![]Chunk {
     var chunker = Chunker.init();
     defer chunker.deinit(allocator);

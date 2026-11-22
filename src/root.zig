@@ -1,5 +1,4 @@
-//! Transport-independent Xet storage using only Zig's standard library.
-//! `http` is an optional standard-CAS adapter, not a Hub client.
+//! Standard-library Xet storage with an optional standard-CAS adapter, not a Hub client
 
 pub const Hash = @import("hash.zig").Hash;
 pub const Node = @import("hash.zig").Node;
@@ -18,8 +17,15 @@ pub const StorePublisher = @import("store.zig").Publisher;
 pub const ObjectKind = @import("store.zig").ObjectKind;
 pub const Package = @import("store.zig").Package;
 pub const PackOptions = @import("store.zig").PackOptions;
+pub const PublisherOptions = @import("store.zig").PublisherOptions;
+pub const NewXorbListener = @import("store.zig").NewXorbListener;
 pub const pack = @import("store.zig").pack;
 pub const publish = @import("store.zig").publish;
+pub const DedupSource = @import("dedup.zig").Source;
+pub const DedupMatch = @import("dedup.zig").Match;
+pub const DedupShardIndex = @import("dedup.zig").ShardIndex;
+pub const DedupSessionIndex = @import("dedup.zig").SessionIndex;
+pub const UploadPlan = @import("store.zig").Plan;
 pub const reconstruction = @import("reconstruction.zig");
 pub const http = @import("http.zig");
 

@@ -7,7 +7,7 @@ pub const AllocEvent = struct {
     live: bool = true,
 };
 
-/// Records ownership operations; optionally retains freed storage until teardown.
+/// Records ownership operations and optionally retains freed storage
 pub const TrackingAllocator = struct {
     backing: std.mem.Allocator,
     fail_at: ?usize = null,
@@ -222,13 +222,15 @@ pub const HttpExchange = struct {
     body: []u8,
 };
 
-/// Independent connections isolate failed requests during assertions.
+/// Independent connections isolate failed requests during assertions
 pub const Loopback = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     server: std.Io.net.Server,
     origin: []u8,
     responses: []const HttpResponse,
+    global_dedup_shard: ?[]const u8 = null,
+    stop_after_shard: bool = false,
     exchanges: std.ArrayList(HttpExchange) = .empty,
     exchange_mutex: std.Io.Mutex = .init,
     futures: std.ArrayList(std.Io.Future(void)) = .empty,
@@ -252,6 +254,12 @@ pub const Loopback = struct {
         if (self.futures.items.len != 0) return error.TestServerAlreadyStarted;
         const future = try self.io.concurrent(serve, .{self});
         try self.futures.append(self.allocator, future);
+    }
+
+    pub fn startGlobalDedup(self: *Loopback, shard_bytes: ?[]const u8) !void {
+        self.global_dedup_shard = shard_bytes;
+        self.stop_after_shard = true;
+        try self.start();
     }
 
     pub fn finish(self: *Loopback, count: usize) !void {
@@ -279,10 +287,20 @@ pub const Loopback = struct {
     }
 
     fn serve(self: *Loopback) void {
-        for (self.responses) |response| self.handleOne(response) catch return;
+        if (self.stop_after_shard) {
+            while (true) {
+                const target = self.handleOne(.{}) catch return;
+                defer self.allocator.free(target);
+                if (std.mem.endsWith(u8, target, "/shards")) return;
+            }
+        }
+        for (self.responses) |response| {
+            const target = self.handleOne(response) catch return;
+            self.allocator.free(target);
+        }
     }
 
-    fn handleOne(self: *Loopback, response: HttpResponse) !void {
+    fn handleOne(self: *Loopback, response: HttpResponse) ![]u8 {
         var connection = try self.server.accept(self.io);
         defer connection.close(self.io);
         var read_buffer: [16 * 1024]u8 = undefined;
@@ -331,11 +349,22 @@ pub const Loopback = struct {
             headers[header_count] = .{ .name = "Content-Encoding", .value = value };
             header_count += 1;
         }
-        try request.respond(response.body, .{
-            .status = response.status,
+        var actual_response = response;
+        if (self.global_dedup_shard != null and std.mem.startsWith(u8, target, "/v1/chunks/")) {
+            actual_response.body = self.global_dedup_shard.?;
+        } else if (self.stop_after_shard and std.mem.startsWith(u8, target, "/v1/chunks/")) {
+            actual_response.status = .not_found;
+        } else if (self.stop_after_shard and std.mem.endsWith(u8, target, "/shards")) {
+            actual_response.body =
+                \\{"type":"result"}
+            ;
+        }
+        try request.respond(actual_response.body, .{
+            .status = actual_response.status,
             .keep_alive = false,
             .extra_headers = headers[0..header_count],
         });
+        return self.allocator.dupe(u8, target);
     }
 };
 
@@ -345,7 +374,7 @@ pub const XorbChunk = struct {
     record_end: usize,
 };
 
-/// Independent reader for complete or footerless uncompressed Xorbs.
+/// Independent reader for complete or footerless uncompressed Xorbs
 pub fn readUncompressedXorb(allocator: std.mem.Allocator, bytes: []const u8) ![]XorbChunk {
     if (bytes.len < 4) return error.TestInvalidXorb;
     const footer_length = std.mem.readInt(u32, bytes[bytes.len - 4 ..][0..4], .little);

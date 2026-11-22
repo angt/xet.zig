@@ -1,4 +1,4 @@
-//! LZ4 codec; decodes linked blocks and encodes independent 64 KiB blocks.
+//! LZ4 codec. Decodes linked blocks and encodes independent 64 KiB blocks
 
 const std = @import("std");
 
@@ -18,55 +18,55 @@ fn checksum(data: []const u8) u32 {
     return std.hash.XxHash32.hash(0, data);
 }
 
-fn lengthBytes(value: usize) usize {
-    return if (value >= 15) (value - 15) / 255 + 1 else 0;
+fn lenSize(n: usize) usize {
+    return if (n >= 15) (n - 15) / 255 + 1 else 0;
 }
 
-fn writeLength(dst: []u8, pos: *usize, value: usize) void {
-    var remaining = value;
-    while (remaining >= 255) : (remaining -= 255) {
+fn writeLen(dst: []u8, pos: *usize, n: usize) void {
+    var left = n;
+    while (left >= 255) : (left -= 255) {
         dst[pos.*] = 255;
         pos.* += 1;
     }
-    dst[pos.*] = @intCast(remaining);
+    dst[pos.*] = @intCast(left);
     pos.* += 1;
 }
 
-fn writeSequence(
+fn writeSeq(
     dst: []u8,
     pos: *usize,
-    literals: []const u8,
-    match: ?struct { offset: usize, length: usize },
+    lits: []const u8,
+    match: ?struct { offset: usize, len: usize },
 ) bool {
-    const match_length = if (match) |value| value.length - 4 else 0;
-    const needed = 1 + lengthBytes(literals.len) + literals.len +
-        if (match != null) 2 + lengthBytes(match_length) else 0;
+    const match_len = if (match) |m| m.len - 4 else 0;
+    const needed = 1 + lenSize(lits.len) + lits.len +
+        if (match != null) 2 + lenSize(match_len) else 0;
     if (pos.* + needed >= dst.len) return false;
 
-    const literal_token: u8 = @intCast(@min(literals.len, 15));
-    const match_token: u8 = @intCast(@min(match_length, 15));
-    dst[pos.*] = (literal_token << 4) | match_token;
+    const lit_token: u8 = @intCast(@min(lits.len, 15));
+    const match_token: u8 = @intCast(@min(match_len, 15));
+    dst[pos.*] = (lit_token << 4) | match_token;
     pos.* += 1;
-    if (literals.len >= 15) writeLength(dst, pos, literals.len - 15);
-    @memcpy(dst[pos.*..][0..literals.len], literals);
-    pos.* += literals.len;
-    if (match) |value| {
-        std.mem.writeInt(u16, dst[pos.*..][0..2], @intCast(value.offset), .little);
+    if (lits.len >= 15) writeLen(dst, pos, lits.len - 15);
+    @memcpy(dst[pos.*..][0..lits.len], lits);
+    pos.* += lits.len;
+    if (match) |m| {
+        std.mem.writeInt(u16, dst[pos.*..][0..2], @intCast(m.offset), .little);
         pos.* += 2;
-        if (match_length >= 15) writeLength(dst, pos, match_length - 15);
+        if (match_len >= 15) writeLen(dst, pos, match_len - 15);
     }
     return true;
 }
 
-fn readLength(input: []const u8, position: *usize, initial: usize) !usize {
+fn readLen(src: []const u8, pos: *usize, initial: usize) !usize {
     if (initial != 15) return initial;
-    var length = initial;
+    var len = initial;
     while (true) {
-        if (position.* >= input.len) return error.InvalidFrame;
-        const byte = input[position.*];
-        position.* += 1;
-        length = std.math.add(usize, length, byte) catch return error.InvalidFrame;
-        if (byte != 255) return length;
+        if (pos.* >= src.len) return error.InvalidFrame;
+        const byte = src[pos.*];
+        pos.* += 1;
+        len = std.math.add(usize, len, byte) catch return error.InvalidFrame;
+        if (byte != 255) return len;
     }
 }
 
@@ -74,101 +74,103 @@ pub const Scratch = struct {
     table: [1 << 13]u16 = undefined,
 };
 
-/// `dst` must have `input.len` bytes. Returns `null` unless compression shrinks.
-fn compressBlock(scratch: *Scratch, input: []const u8, dst: []u8) ?usize {
+/// `dst` must have `input.len` bytes. Returns `null` unless compression shrinks
+fn encodeBlock(scratch: *Scratch, input: []const u8, dst: []u8) ?usize {
     std.debug.assert(input.len <= block_size);
     std.debug.assert(dst.len == input.len);
     @memset(&scratch.table, std.math.maxInt(u16));
 
     var out_pos: usize = 0;
     var anchor: usize = 0;
-    var position: usize = 0;
-    var search_start: usize = 0;
-    while (position + match_end_padding <= input.len) {
-        const word = std.mem.readInt(u32, input[position..][0..4], .little);
+    var pos: usize = 0;
+    var search: usize = 0;
+    while (pos + match_end_padding <= input.len) {
+        const word = std.mem.readInt(u32, input[pos..][0..4], .little);
         const slot: usize = @intCast((word *% 2654435761) >> 19);
-        const previous = scratch.table[slot];
-        scratch.table[slot] = @intCast(position);
-        if (previous == std.math.maxInt(u16) or
-            std.mem.readInt(u32, input[previous..][0..4], .little) != word)
-        {
-            position += 1 + ((position - search_start) >> 6);
+        const prev = scratch.table[slot];
+        scratch.table[slot] = @intCast(pos);
+        const mismatch = prev == std.math.maxInt(u16) or
+            std.mem.readInt(u32, input[prev..][0..4], .little) != word;
+        if (mismatch) {
+            pos += 1 + ((pos - search) >> 6);
             continue;
         }
 
-        const match_limit = input.len - last_literals;
-        var length: usize = 4;
-        while (position + length + 8 <= match_limit) {
-            const difference = std.mem.readInt(u64, input[position + length ..][0..8], .little) ^
-                std.mem.readInt(u64, input[previous + length ..][0..8], .little);
-            if (difference != 0) {
-                length += @ctz(difference) >> 3;
+        const limit = input.len - last_literals;
+        var len: usize = 4;
+        while (pos + len + 8 <= limit) {
+            const diff = std.mem.readInt(u64, input[pos + len ..][0..8], .little) ^
+                std.mem.readInt(u64, input[prev + len ..][0..8], .little);
+            if (diff != 0) {
+                len += @ctz(diff) >> 3;
                 break;
             }
-            length += 8;
+            len += 8;
         }
-        while (position + length < match_limit and
-            input[previous + length] == input[position + length]) : (length += 1)
-        {}
-        if (!writeSequence(dst, &out_pos, input[anchor..position], .{
-            .offset = position - previous,
-            .length = length,
+        while (pos + len < limit and input[prev + len] == input[pos + len]) : (len += 1) {}
+        if (!writeSeq(dst, &out_pos, input[anchor..pos], .{
+            .offset = pos - prev,
+            .len = len,
         })) return null;
-        position += length;
-        anchor = position;
-        search_start = position;
+        pos += len;
+        anchor = pos;
+        search = pos;
     }
-    if (!writeSequence(dst, &out_pos, input[anchor..], null)) return null;
+    if (!writeSeq(dst, &out_pos, input[anchor..], null)) return null;
     return out_pos;
 }
 
 fn decodeBlock(
-    input: []const u8,
-    output: []u8,
-    output_position: *usize,
-    history_start: usize,
+    src: []const u8,
+    dst: []u8,
+    dst_pos: *usize,
+    history: usize,
 ) !void {
-    var position: usize = 0;
-    var out_pos = output_position.*;
-    defer output_position.* = out_pos;
+    var pos: usize = 0;
+    var out = dst_pos.*;
+    defer dst_pos.* = out;
 
-    while (position < input.len) {
-        const token = input[position];
-        position += 1;
+    while (pos < src.len) {
+        const token = src[pos];
+        pos += 1;
 
-        const literal_length = try readLength(input, &position, token >> 4);
-        if (literal_length > input.len - position or
-            literal_length > output.len - out_pos) return error.InvalidFrame;
-        @memcpy(output[out_pos..][0..literal_length], input[position..][0..literal_length]);
-        position += literal_length;
-        out_pos += literal_length;
-        if (position == input.len) {
+        const lit_len = try readLen(src, &pos, token >> 4);
+        const too_long = lit_len > src.len - pos or
+            lit_len > dst.len - out;
+        if (too_long) {
+            return error.InvalidFrame;
+        }
+        @memcpy(dst[out..][0..lit_len], src[pos..][0..lit_len]);
+        pos += lit_len;
+        out += lit_len;
+        if (pos == src.len) {
             if (token & 0x0f != 0) return error.InvalidFrame;
             return;
         }
-        if (input.len - position < 2) return error.InvalidFrame;
+        if (src.len - pos < 2) return error.InvalidFrame;
 
-        const offset = std.mem.readInt(u16, input[position..][0..2], .little);
-        position += 2;
-        if (offset == 0 or offset > out_pos - history_start) return error.InvalidFrame;
-        const short_length = try readLength(input, &position, token & 0x0f);
-        const match_length = std.math.add(usize, short_length, 4) catch return error.InvalidFrame;
-        if (match_length > output.len - out_pos) return error.InvalidFrame;
+        const offset = std.mem.readInt(u16, src[pos..][0..2], .little);
+        pos += 2;
+        if (offset == 0 or offset > out - history) return error.InvalidFrame;
+        const short_len = try readLen(src, &pos, token & 0x0f);
+        const match_len = std.math.add(usize, short_len, 4) catch
+            return error.InvalidFrame;
+        if (match_len > dst.len - out) return error.InvalidFrame;
 
-        if (offset >= match_length) {
-            @memcpy(output[out_pos..][0..match_length], output[out_pos - offset ..][0..match_length]);
+        if (offset >= match_len) {
+            @memcpy(dst[out..][0..match_len], dst[out - offset ..][0..match_len]);
         } else if (offset == 1) {
-            @memset(output[out_pos..][0..match_length], output[out_pos - 1]);
+            @memset(dst[out..][0..match_len], dst[out - 1]);
         } else {
-            @memcpy(output[out_pos..][0..offset], output[out_pos - offset ..][0..offset]);
+            @memcpy(dst[out..][0..offset], dst[out - offset ..][0..offset]);
             var copied: usize = offset;
-            while (copied < match_length) {
-                const count = @min(copied, match_length - copied);
-                @memcpy(output[out_pos + copied ..][0..count], output[out_pos..][0..count]);
-                copied += count;
+            while (copied < match_len) {
+                const n = @min(copied, match_len - copied);
+                @memcpy(dst[out + copied ..][0..n], dst[out..][0..n]);
+                copied += n;
             }
         }
-        out_pos += match_length;
+        out += match_len;
     }
 }
 
@@ -262,34 +264,39 @@ pub fn compressInto(
 
     var header: [15]u8 = undefined;
     std.mem.writeInt(u32, header[0..4], magic, .little);
-    header[4] = 0x6c; // Version 1, independent blocks, content size and checksum.
-    header[5] = 0x40; // 64 KiB maximum block size.
+    header[4] = 0x6c; // Version 1, independent blocks, content size and checksum
+    header[5] = 0x40; // 64 KiB maximum block size
     std.mem.writeInt(u64, header[6..14], input.len, .little);
     header[14] = @truncate(checksum(header[4..14]) >> 8);
     output.appendSliceAssumeCapacity(&header);
 
-    var position: usize = 0;
-    while (position < input.len) {
-        const size = @min(block_size, input.len - position);
-        const block = input[position..][0..size];
+    var pos: usize = 0;
+    while (pos < input.len) {
+        const size = @min(block_size, input.len - pos);
+        const block = input[pos..][0..size];
         output.items.len += 4;
-        const payload_position = output.items.len;
+        const payload_pos = output.items.len;
         output.items.len += size;
-        const dst = output.items[payload_position..][0..size];
+        const dst = output.items[payload_pos..][0..size];
 
-        if (compressBlock(scratch, block, dst)) |compressed_size| {
-            output.items.len = payload_position + compressed_size;
-            std.mem.writeInt(u32, output.items[payload_position - 4 ..][0..4], @intCast(compressed_size), .little);
+        if (encodeBlock(scratch, block, dst)) |encoded_size| {
+            output.items.len = payload_pos + encoded_size;
+            std.mem.writeInt(
+                u32,
+                output.items[payload_pos - 4 ..][0..4],
+                @intCast(encoded_size),
+                .little,
+            );
         } else {
             @memcpy(dst, block);
             std.mem.writeInt(
                 u32,
-                output.items[payload_position - 4 ..][0..4],
+                output.items[payload_pos - 4 ..][0..4],
                 @as(u32, @intCast(size)) | 0x80000000,
                 .little,
             );
         }
-        position += size;
+        pos += size;
     }
 
     var trailer: [8]u8 = @splat(0);
@@ -297,7 +304,7 @@ pub fn compressInto(
     output.appendSliceAssumeCapacity(&trailer);
 }
 
-/// Allocates scratch internally; use `compressInto` to supply scratch.
+/// Allocates scratch internally. Use `compressInto` to supply scratch
 pub fn compress(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(allocator);
@@ -315,9 +322,9 @@ test "block decoder handles non-overlapping and repeating matches" {
         for ([_]usize{ 4, 5, 15, 16, 19, 20, 64, 255, 1024 }) |match_length| {
             var encoded_buf: [256]u8 = undefined;
             var encoded_len: usize = 0;
-            try std.testing.expect(writeSequence(&encoded_buf, &encoded_len, prefix[0..offset], .{
+            try std.testing.expect(writeSeq(&encoded_buf, &encoded_len, prefix[0..offset], .{
                 .offset = offset,
-                .length = match_length,
+                .len = match_length,
             }));
 
             const expected = try allocator.alloc(u8, offset + match_length);
@@ -379,8 +386,8 @@ test "every truncated frame is rejected without reading out of bounds" {
     }
     const raw = [_]u8{
         0x04, 0x22, 0x4d, 0x18, 0x60, 0x40, 0x82,
-        1, 0, 0, 0, 0x01, // One-byte compressed block with an invalid final token.
-        0, 0, 0, 0, // End mark.
+        1, 0, 0, 0, 0x01, // Compressed block with an invalid final token
+        0, 0, 0, 0, // End mark
     };
     try std.testing.expectError(error.InvalidFrame, decompress(allocator, &raw, 0));
 }

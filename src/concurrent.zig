@@ -1,4 +1,4 @@
-//! Bounded concurrent transfer helpers built on `std.Io.Select`.
+//! Bounded concurrent transfer helpers built on `std.Io.Select`
 
 const std = @import("std");
 const constants = @import("constants.zig");
@@ -12,8 +12,7 @@ const xorb = @import("xorb.zig");
 const UploadCompletion = union(enum) { result: ?*UploadTask };
 const TermCompletion = union(enum) { result: ?*TermTask };
 
-/// Copies each Xorb so at most `window` payloads are in flight.
-/// The allocator and downstream store must be safe for concurrent use.
+/// Copies up to `window` in-flight Xorbs and requires a thread-safe allocator and store
 pub const UploadStore = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -60,7 +59,7 @@ pub const UploadStore = struct {
         }
         if (self.first_error) |err| return err;
         if (self.in_flight == self.tasks.len) {
-            try self.completeOne();
+            try self.awaitOne();
             if (self.first_error) |err| return err;
         }
         const task = try self.allocator.create(UploadTask);
@@ -85,20 +84,20 @@ pub const UploadStore = struct {
             .data = task.data,
             .raw_size = task.raw_size,
         }) catch |err| {
-            task.error_value = err;
+            task.err = err;
         };
         return task;
     }
 
-    fn completeOne(self: *UploadStore) !void {
+    fn awaitOne(self: *UploadStore) !void {
         const task = (try self.select.await()).result.?;
-        if (self.first_error == null) self.first_error = task.error_value;
+        if (self.first_error == null) self.first_error = task.err;
         task.deinit(self.allocator);
         self.in_flight -= 1;
     }
 
     pub fn finish(self: *UploadStore) !void {
-        while (self.in_flight != 0) try self.completeOne();
+        while (self.in_flight != 0) try self.awaitOne();
         if (self.first_error) |err| return err;
     }
 };
@@ -108,7 +107,7 @@ const UploadTask = struct {
     data: []u8,
     hash: hashing.Hash,
     raw_size: u64,
-    error_value: ?anyerror = null,
+    err: ?anyerror = null,
 
     fn deinit(self: *UploadTask, allocator: std.mem.Allocator) void {
         allocator.free(self.data);
@@ -118,12 +117,11 @@ const UploadTask = struct {
 
 pub const ConsumeOptions = struct {
     window: usize = 4,
-    /// Bounds read-ahead to `window * max_term_size` encoded bytes.
-    /// Larger terms use sequential streaming.
+    /// Bounds prefetch by `window * max_term_size` and streams larger terms
     max_term_size: usize = constants.max_xorb_size,
 };
 
-/// Decode prefetched terms in file order.
+/// Decode prefetched terms in file order
 pub fn consume(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -173,7 +171,7 @@ pub fn consume(
     const completed = try allocator.alloc(bool, options.window);
     defer allocator.free(completed);
     @memset(completed, false);
-    // LIFO defers drain workers before tasks and shared context are freed.
+    // Workers must stop before their tasks and context are freed
     defer select.cancelDiscard();
 
     var next: usize = 0;
@@ -193,12 +191,12 @@ pub fn consume(
         const task = tasks[current % options.window].?;
         while (!completed[current % options.window]) {
             const finished = (try select.await()).result.?;
-            // Await synchronizes task writes; identity handles out-of-order completion.
+            // Await synchronizes task writes. Results may complete out of order
             completed[finished.index % options.window] = true;
-            if (finished.error_value) |err| return err;
+            if (finished.err) |err| return err;
         }
         tasks[current % options.window] = null;
-        const decoded = decodeTask(task, &context) catch |err| {
+        const decoded = decode(task, &context) catch |err| {
             task.deinit();
             if (verifier) |*value| return value.failure(err);
             return err;
@@ -226,7 +224,7 @@ const TermTask = struct {
     context: *Context,
     index: usize,
     data: []u8 = &.{},
-    error_value: ?anyerror = null,
+    err: ?anyerror = null,
 
     fn deinit(self: *TermTask) void {
         self.context.allocator.free(self.data);
@@ -236,7 +234,7 @@ const TermTask = struct {
 
 fn fetch(task: *TermTask) ?*TermTask {
     fetchInner(task) catch |err| {
-        task.error_value = err;
+        task.err = err;
     };
     return task;
 }
@@ -261,7 +259,7 @@ fn fetchInner(task: *TermTask) !void {
     };
 }
 
-fn decodeTask(task: *TermTask, context: *Context) !u64 {
+fn decode(task: *TermTask, context: *Context) !u64 {
     var source: std.Io.Reader = .fixed(task.data);
     var output = reconstruction.RangeWriter{
         .output = context.sink,
@@ -312,7 +310,7 @@ const TestFetch = struct {
             return error.ReadFailed;
         }
         if (parent.failure == .decode and self.index == 0 and self.position == 0) {
-            try writer.writeAll(&.{1}); // Unsupported chunk version.
+            try writer.writeAll(&.{1}); // Unsupported chunk version
             self.position = 1;
             return 1;
         }
