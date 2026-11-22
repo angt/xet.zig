@@ -231,6 +231,7 @@ pub const Loopback = struct {
     responses: []const HttpResponse,
     global_dedup_shard: ?[]const u8 = null,
     stop_after_shard: bool = false,
+    lookup_status: ?std.http.Status = null,
     exchanges: std.ArrayList(HttpExchange) = .empty,
     exchange_mutex: std.Io.Mutex = .init,
     futures: std.ArrayList(std.Io.Future(void)) = .empty,
@@ -350,7 +351,9 @@ pub const Loopback = struct {
             header_count += 1;
         }
         var actual_response = response;
-        if (self.global_dedup_shard != null and std.mem.startsWith(u8, target, "/v1/chunks/")) {
+        if (self.lookup_status != null and std.mem.startsWith(u8, target, "/v1/chunks/")) {
+            actual_response.status = self.lookup_status.?;
+        } else if (self.global_dedup_shard != null and std.mem.startsWith(u8, target, "/v1/chunks/")) {
             actual_response.body = self.global_dedup_shard.?;
         } else if (self.stop_after_shard and std.mem.startsWith(u8, target, "/v1/chunks/")) {
             actual_response.status = .not_found;

@@ -35,7 +35,7 @@ pub const PackOptions = struct {
     max_xorb_size: u64 = constants.max_xorb_size,
     max_xorb_chunks: u32 = constants.max_xorb_chunks,
 
-    fn validate(self: PackOptions) !void {
+    pub fn validate(self: PackOptions) !void {
         if (self.max_xorb_size == 0 or self.max_xorb_size > constants.max_xorb_size or
             self.max_xorb_chunks == 0 or self.max_xorb_chunks > constants.max_xorb_chunks)
             return error.InvalidOptions;
@@ -128,8 +128,8 @@ pub fn pack(
         }
         const object = try xorb.serialize(allocator, source_chunks[first..end], options.compression);
         objects.append(allocator, object) catch |err| {
-            var mutable = object;
-            mutable.deinit(allocator);
+            var owned = object;
+            owned.deinit(allocator);
             return err;
         };
         try segments.append(allocator, .{
@@ -184,7 +184,7 @@ pub fn publish(allocator: std.mem.Allocator, package: *const Package, store: Sto
 pub const max_shard_size = 64 * 1024 * 1024;
 const empty_shard_size = shard.header_size + 2 * shard.entry_size;
 
-fn publishShard(allocator: std.mem.Allocator, bytes: []const u8, raw_size: u64, destination: Store) !void {
+pub fn publishShard(allocator: std.mem.Allocator, bytes: []const u8, raw_size: u64, destination: Store) !void {
     return publishShardLimited(allocator, bytes, raw_size, destination, max_shard_size);
 }
 
@@ -235,10 +235,10 @@ fn publishShardLimited(
         files.deinit(allocator);
     }
     size = empty_shard_size;
-    var file_record_index: u32 = 0;
+    var file_index: u32 = 0;
     for (0..reader.footer.file_count) |_| {
-        const info = try reader.fileAt(file_record_index);
-        file_record_index = @intCast((info.end - shard.header_size) / shard.entry_size);
+        const info = try reader.fileAt(file_index);
+        file_index = @intCast((info.end - shard.header_size) / shard.entry_size);
         const addition = info.end - info.offset;
         if (files.items.len != 0 and addition > limit - size) {
             try flushFiles(allocator, &files, raw_size, destination, limit);
@@ -307,10 +307,10 @@ pub const PublishResult = struct {
 
 /// Owned reconstruction metadata for custom upload pipelines
 pub const Plan = struct {
-    file: shard.File,
-    new_xorbs: []shard.Xorb,
-    size: u64,
-    xorb_count: u64,
+    file: shard.File = .{ .hash = hashing.zero, .segments = &.{} },
+    new_xorbs: []shard.Xorb = &.{},
+    size: u64 = 0,
+    xorb_count: u64 = 0,
 
     pub fn fromFile(file: shard.File, new_xorbs: []shard.Xorb, size: u64) Plan {
         return .{
@@ -331,13 +331,74 @@ pub const Plan = struct {
 
     /// Consumes the plan's metadata, even on failure
     pub fn publish(self: *Plan, allocator: std.mem.Allocator, destination: Store) !PublishResult {
+        const result = PublishResult{
+            .file_hash = self.file.hash,
+            .size = self.size,
+            .xorb_count = self.xorb_count,
+        };
         defer self.deinit(allocator);
-        const shard_bytes = try shard.serialize(allocator, &.{self.file}, self.new_xorbs);
-        defer allocator.free(shard_bytes);
-        try publishShard(allocator, shard_bytes, self.size, destination);
-        return .{ .file_hash = self.file.hash, .size = self.size, .xorb_count = self.xorb_count };
+        var batch = BatchPublisher.init(allocator, destination);
+        defer batch.deinit();
+        try batch.append(self);
+        try batch.finish();
+        return result;
     }
 };
+
+/// Aggregates file and new-Xorb metadata without batching Xorb payloads
+pub const BatchPublisher = struct {
+    allocator: std.mem.Allocator,
+    destination: Store,
+    plans: std.ArrayList(Plan) = .empty,
+    finished: bool = false,
+
+    pub fn init(allocator: std.mem.Allocator, destination: Store) BatchPublisher {
+        return .{ .allocator = allocator, .destination = destination };
+    }
+
+    pub fn deinit(self: *BatchPublisher) void {
+        for (self.plans.items) |*plan| plan.deinit(self.allocator);
+        self.plans.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    /// Moves `plan` into the batch on success, leaving it empty. On failure,
+    /// the caller retains ownership of the unchanged plan. All allocations owned
+    /// by `plan` must have been made with the allocator passed to `init`.
+    pub fn append(self: *BatchPublisher, plan: *Plan) !void {
+        if (self.finished) return error.AlreadyFinished;
+        try self.plans.ensureUnusedCapacity(self.allocator, 1);
+        self.plans.appendAssumeCapacity(plan.*);
+        plan.* = .{};
+    }
+
+    /// Publishes all appended metadata, using the standard shard size limit
+    pub fn finish(self: *BatchPublisher) !void {
+        if (self.finished) return error.AlreadyFinished;
+        self.finished = true;
+
+        var files: std.ArrayList(shard.File) = .empty;
+        defer files.deinit(self.allocator);
+        var new_xorbs: std.ArrayList(shard.Xorb) = .empty;
+        defer new_xorbs.deinit(self.allocator);
+        var hashes: std.AutoHashMapUnmanaged(hashing.Hash, void) = .empty;
+        defer hashes.deinit(self.allocator);
+        var raw_size: u64 = 0;
+        for (self.plans.items) |plan| {
+            try new_xorbs.appendSlice(self.allocator, plan.new_xorbs);
+            const entry = try hashes.getOrPut(self.allocator, plan.file.hash);
+            if (entry.found_existing) continue;
+            try files.append(self.allocator, plan.file);
+            raw_size = std.math.add(u64, raw_size, plan.size) catch return error.FileTooLarge;
+        }
+        if (files.items.len == 0) return;
+        const bytes = try shard.serialize(self.allocator, files.items, new_xorbs.items);
+        defer self.allocator.free(bytes);
+        try publishShard(self.allocator, bytes, raw_size, self.destination);
+    }
+};
+
+pub const dedup_window = 64;
 
 /// Buffers one Xorb, shard metadata, and up to 64 dedup chunks
 pub const Publisher = struct {
@@ -358,8 +419,9 @@ pub const Publisher = struct {
     reused_xorb: ?hashing.Hash = null,
     reused_next_chunk: u32 = 0,
     reused_verification: std.crypto.hash.Blake3 = .init(.{ .key = constants.verification_key }),
-    pending_chunks: std.ArrayList(chunker.Chunk) = .empty,
-    pending_hashes: std.ArrayList(hashing.Hash) = .empty,
+    pending_chunks: [dedup_window]chunker.Chunk = undefined,
+    pending_head: usize = 0,
+    pending_len: usize = 0,
 
     /// Borrows the dedup source, listener, and callback metadata
     pub fn init(allocator: std.mem.Allocator, destination: Store, options: PublisherOptions) !Publisher {
@@ -380,9 +442,10 @@ pub const Publisher = struct {
         self.checks.deinit(self.allocator);
         for (self.xorbs.items) |object| self.allocator.free(object.chunks);
         self.xorbs.deinit(self.allocator);
-        for (self.pending_chunks.items) |chunk| self.allocator.free(chunk.data);
-        self.pending_chunks.deinit(self.allocator);
-        self.pending_hashes.deinit(self.allocator);
+        for (0..self.pending_len) |index| {
+            const chunk = self.pending_chunks[(self.pending_head + index) % dedup_window];
+            self.allocator.free(chunk.data);
+        }
     }
 
     pub fn write(self: *Publisher, input: []const u8) !void {
@@ -401,7 +464,6 @@ pub const Publisher = struct {
         return plan.publish(self.allocator, self.destination);
     }
 
-    /// Returns the reconstruction without publishing it
     pub fn finishPlan(self: *Publisher) !Plan {
         if (self.finished) return error.AlreadyFinished;
         self.finished = true;
@@ -521,8 +583,8 @@ pub const Publisher = struct {
     }
 
     fn addChunk(self: *Publisher, chunk: chunker.Chunk) !void {
-        if (self.options.dedup_source != null) {
-            if (self.pending_chunks.items.len == 64) try self.processPending();
+        if (self.options.dedup_source) |source| {
+            if (self.pending_len == dedup_window) try self.processOne(source);
             try self.buffer(chunk);
             return;
         }
@@ -531,37 +593,38 @@ pub const Publisher = struct {
 
     fn buffer(self: *Publisher, chunk: chunker.Chunk) !void {
         const data = try self.allocator.dupe(u8, chunk.data);
-        errdefer self.allocator.free(data);
-        try self.pending_chunks.append(self.allocator, .{ .data = data, .hash = chunk.hash });
-        errdefer self.pending_chunks.shrinkRetainingCapacity(self.pending_chunks.items.len - 1);
-        try self.pending_hashes.append(self.allocator, chunk.hash);
+        const index = (self.pending_head + self.pending_len) % dedup_window;
+        self.pending_chunks[index] = .{ .data = data, .hash = chunk.hash };
+        self.pending_len += 1;
     }
 
     fn dropPending(self: *Publisher, count: usize) void {
-        for (self.pending_chunks.items[0..count]) |chunk| self.allocator.free(chunk.data);
-        for (self.pending_chunks.items[count..], self.pending_hashes.items[count..], 0..) |chunk, hash, index| {
-            self.pending_chunks.items[index] = chunk;
-            self.pending_hashes.items[index] = hash;
+        for (0..count) |index| {
+            const chunk = self.pending_chunks[(self.pending_head + index) % dedup_window];
+            self.allocator.free(chunk.data);
         }
-        self.pending_chunks.shrinkRetainingCapacity(self.pending_chunks.items.len - count);
-        self.pending_hashes.shrinkRetainingCapacity(self.pending_hashes.items.len - count);
+        self.pending_head = (self.pending_head + count) % dedup_window;
+        self.pending_len -= count;
     }
 
     fn processPending(self: *Publisher) !void {
         const source = self.options.dedup_source orelse return;
-        while (self.pending_chunks.items.len != 0) try self.processBatch(source);
+        while (self.pending_len != 0) try self.processOne(source);
     }
 
-    fn processBatch(self: *Publisher, source: DedupSource) !void {
-        const found = try source.query(self.allocator, self.pending_hashes.items);
-        if (found) |located| {
-            var match = located;
+    fn processOne(self: *Publisher, source: DedupSource) !void {
+        var hashes: [dedup_window]hashing.Hash = undefined;
+        for (0..self.pending_len) |index| {
+            hashes[index] = self.pending_chunks[(self.pending_head + index) % dedup_window].hash;
+        }
+        if (try source.query(self.allocator, hashes[0..self.pending_len])) |found| {
+            var match = found;
             defer match.deinit(self.allocator);
             try self.appendReuse(match.xorb_hash, match.chunk_index_start, match.nodes);
             self.dropPending(match.nodes.len);
             return;
         }
-        const first = self.pending_chunks.items[0];
+        const first = self.pending_chunks[self.pending_head];
         try self.addNew(first);
         self.dropPending(1);
     }
@@ -707,6 +770,112 @@ fn regressionPublisherMetadataFailureAfterStore(offset: usize) !void {
 fn regressionPublisherStoreSweep() !void {
     const result = try regressionPublisherFailure(.store, null);
     try std.testing.expect(result.failed);
+}
+
+fn regressionRingFailure(fail_at: ?usize) !usize {
+    const support = @import("regression_support");
+    const Context = struct {
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const hashing.Hash) !?dedup.Match {
+            return null;
+        }
+    };
+    var tracker = support.TrackingAllocator{ .backing = std.testing.allocator, .fail_at = fail_at };
+    defer tracker.deinit();
+    var destination = support.MemoryStore{ .allocator = std.testing.allocator };
+    defer destination.deinit();
+    var dummy: u8 = 0;
+    var failed = false;
+    _ = blk: {
+        var publisher = Publisher.init(tracker.allocator(), destination.store(), .{
+            .compression = .none,
+            .dedup_source = .{ .context = &dummy, .query_fn = Context.query },
+        }) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            failed = true;
+            break :blk;
+        };
+        defer publisher.deinit();
+        for (0..100) |index| {
+            publisher.addChunk(.{
+                .data = "x",
+                .hash = support.syntheticHash(1, index),
+            }) catch |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                failed = true;
+                break :blk;
+            };
+        }
+        var plan = publisher.finishPlan() catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            failed = true;
+            break :blk;
+        };
+        plan.deinit(tracker.allocator());
+    };
+    try std.testing.expectEqual(fail_at != null, failed);
+    try std.testing.expectEqual(@as(usize, 0), tracker.outstanding());
+    try std.testing.expectEqual(@as(usize, 0), tracker.duplicate_frees);
+    try std.testing.expectEqual(@as(usize, 0), tracker.invalid_frees);
+    return tracker.allocation_count;
+}
+
+fn regressionBatchFailure(fail_at: ?usize) !usize {
+    const support = @import("regression_support");
+    var tracker = support.TrackingAllocator{ .backing = std.testing.allocator, .fail_at = fail_at };
+    defer tracker.deinit();
+    var destination = support.MemoryStore{ .allocator = std.testing.allocator };
+    defer destination.deinit();
+    const allocator = tracker.allocator();
+    var expected_failure = false;
+    _ = blk: {
+        var batch = BatchPublisher.init(allocator, destination.store());
+        defer batch.deinit();
+        for ([_][]const u8{ "AAA", "BBB" }) |input| {
+            var publisher = Publisher.init(allocator, destination.store(), .{ .compression = .none }) catch |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                expected_failure = true;
+                break :blk;
+            };
+            defer publisher.deinit();
+            publisher.write(input) catch |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                expected_failure = true;
+                break :blk;
+            };
+            var plan = publisher.finishPlan() catch |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                expected_failure = true;
+                break :blk;
+            };
+            defer plan.deinit(allocator);
+            batch.append(&plan) catch |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                expected_failure = true;
+                break :blk;
+            };
+        }
+        batch.finish() catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            expected_failure = true;
+            break :blk;
+        };
+        try std.testing.expectEqual(@as(usize, 1), destination.count(.shard));
+    };
+    if (fail_at != null) try std.testing.expect(expected_failure);
+    try std.testing.expectEqual(@as(usize, 0), tracker.outstanding());
+    try std.testing.expectEqual(@as(usize, 0), tracker.duplicate_frees);
+    try std.testing.expectEqual(@as(usize, 0), tracker.invalid_frees);
+    return tracker.allocation_count;
+}
+
+test "BatchPublisher allocation failures preserve ownership and clean up" {
+    const allocations = try regressionBatchFailure(null);
+    for (0..allocations) |fail_at| _ = try regressionBatchFailure(fail_at);
+}
+
+test "Publisher ring allocation failures are clean" {
+    const allocations = try regressionRingFailure(null);
+    for (0..allocations) |fail_at| _ = try regressionRingFailure(fail_at);
 }
 
 test "Publisher streaming serialization allocation failures are clean" {

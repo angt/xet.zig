@@ -14,6 +14,8 @@ pub const shard = @import("shard.zig");
 pub const store = @import("store.zig");
 pub const Store = store.Store;
 pub const StorePublisher = @import("store.zig").Publisher;
+pub const BatchPublisher = @import("store.zig").BatchPublisher;
+pub const dedup_window = @import("store.zig").dedup_window;
 pub const ObjectKind = @import("store.zig").ObjectKind;
 pub const Package = @import("store.zig").Package;
 pub const PackOptions = @import("store.zig").PackOptions;
@@ -28,6 +30,7 @@ pub const DedupSessionIndex = @import("dedup.zig").SessionIndex;
 pub const UploadPlan = @import("store.zig").Plan;
 pub const reconstruction = @import("reconstruction.zig");
 pub const http = @import("http.zig");
+pub const UploadSession = http.UploadSession;
 
 test {
     const std = @import("std");

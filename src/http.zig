@@ -71,29 +71,37 @@ pub const Client = struct {
         return .{ .context = self, .open_fn = openObject, .close_fn = closeObject, .read_error_fn = readObjectError };
     }
 
+    pub fn uploadSession(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        options: storage.PackOptions,
+    ) !UploadSession {
+        try options.validate();
+        return .{
+            .client = self,
+            .allocator = allocator,
+            .options = options,
+            .global = .{
+                .client = self,
+                .allocator = self.allocator,
+                .io = self.http_client.io,
+                .index = .init(allocator),
+            },
+            .batch = .init(allocator, self.store()),
+        };
+    }
+
     pub fn upload(
         self: *Client,
         allocator: std.mem.Allocator,
         input: []const u8,
         options: storage.PackOptions,
     ) !storage.PublishResult {
-        var global = GlobalDedup{
-            .client = self,
-            .allocator = self.allocator,
-            .io = self.http_client.io,
-            .index = .init(allocator),
-        };
-        defer global.deinit();
-        var opts = storage.PublisherOptions.fromPackOptions(options);
-        opts.dedup_source = global.source();
-        opts.new_xorb_listener = .{
-            .context = &global,
-            .callback = GlobalDedup.addXorb,
-        };
-        var publisher = try storage.Publisher.init(allocator, self.store(), opts);
-        defer publisher.deinit();
-        try publisher.write(input);
-        return publisher.finish();
+        var session = try self.uploadSession(allocator, options);
+        defer session.deinit();
+        try session.addFile(input);
+        try session.finish();
+        return session.results()[0];
     }
 
     /// Downloads and verifies a file. The caller owns the returned bytes
@@ -255,7 +263,7 @@ pub const Client = struct {
         if (response.head.status != .ok) return statusError(response.head.status);
         const body = try readResponse(self.allocator, &response, 64 * 1024);
         defer self.allocator.free(body);
-        // Success is authoritative. was_inserted only reports deduplication
+        // was_inserted only reports deduplication, not upload success
     }
 
     pub fn putShard(self: *Client, bytes: []const u8) !void {
@@ -297,15 +305,80 @@ pub const Client = struct {
     }
 };
 
+/// Streams files immediately and publishes their metadata together
+pub const UploadSession = struct {
+    client: *Client,
+    allocator: std.mem.Allocator,
+    options: storage.PackOptions,
+    global: GlobalDedup,
+    batch: storage.BatchPublisher,
+    results_list: std.ArrayList(storage.PublishResult) = .empty,
+    published: []storage.PublishResult = &.{},
+    finished: bool = false,
+
+    pub fn deinit(self: *UploadSession) void {
+        self.results_list.deinit(self.allocator);
+        self.allocator.free(self.published);
+        self.batch.deinit();
+        self.global.deinit();
+        self.* = undefined;
+    }
+
+    pub fn addFile(self: *UploadSession, input: []const u8) !void {
+        if (self.finished) return error.AlreadyFinished;
+        self.global.beginFile();
+        var options = storage.PublisherOptions.fromPackOptions(self.options);
+        options.dedup_source = self.global.source();
+        options.new_xorb_listener = .{
+            .context = &self.global,
+            .callback = GlobalDedup.addXorb,
+        };
+        var publisher = try storage.Publisher.init(self.allocator, self.client.store(), options);
+        defer publisher.deinit();
+        try publisher.write(input);
+        var plan = try publisher.finishPlan();
+        errdefer plan.deinit(self.allocator);
+        const result = storage.PublishResult{
+            .file_hash = plan.file.hash,
+            .size = plan.size,
+            .xorb_count = plan.xorb_count,
+        };
+        try self.results_list.ensureUnusedCapacity(self.allocator, 1);
+        try self.batch.append(&plan);
+        self.results_list.appendAssumeCapacity(result);
+    }
+
+    pub fn finish(self: *UploadSession) !void {
+        if (self.finished) return error.AlreadyFinished;
+        self.finished = true;
+        const owned = try self.results_list.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(owned);
+        try self.batch.finish();
+        self.published = owned;
+    }
+
+    pub fn results(self: *const UploadSession) []const storage.PublishResult {
+        return self.published;
+    }
+};
+
 const GlobalDedup = struct {
+    const max_missed_remote = 16 * 1024;
+
     client: *Client,
     allocator: std.mem.Allocator,
     io: std.Io,
     index: dedup.SessionIndex,
+    missed_remote: std.AutoHashMapUnmanaged(hashing.Hash, void) = .empty,
     first_query: bool = true,
 
     fn deinit(self: *GlobalDedup) void {
+        self.missed_remote.deinit(self.index.allocator);
         self.index.deinit();
+    }
+
+    fn beginFile(self: *GlobalDedup) void {
+        self.first_query = true;
     }
 
     fn source(self: *GlobalDedup) storage.DedupSource {
@@ -317,43 +390,46 @@ const GlobalDedup = struct {
         try self.index.addXorb(item);
     }
 
-    fn query(raw: *anyopaque, alloc: std.mem.Allocator, hashes: []const hashing.Hash) !?dedup.Match {
+    fn query(raw: *anyopaque, allocator: std.mem.Allocator, hashes: []const hashing.Hash) !?dedup.Match {
         const self: *GlobalDedup = @ptrCast(@alignCast(raw));
         const allow_remote = self.first_query or dedup.eligible(hashes[0]);
         self.first_query = false;
         const local = self.index.source();
-        if (try local.query(alloc, hashes)) |match| return match;
+        if (try local.query(allocator, hashes)) |match| return match;
         if (!allow_remote) return null;
-        const bytes = self.fetch(alloc, hashes[0]) catch |err| switch (err) {
+        const bytes = self.fetch(allocator, hashes[0]) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => null,
         };
         if (bytes) |owned| {
             const now = std.Io.Clock.real.now(self.io).nanoseconds;
-            const secs = @divFloor(now, std.time.ns_per_s);
-            _ = self.index.addGlobalOwned(owned, @intCast(secs)) catch |err| switch (err) {
+            const seconds = @divFloor(now, std.time.ns_per_s);
+            _ = self.index.addGlobalOwned(owned, @intCast(seconds)) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => false,
             };
         }
-        return local.query(alloc, hashes) catch |err| switch (err) {
+        return local.query(allocator, hashes) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => null,
         };
     }
 
-    fn fetch(self: *GlobalDedup, alloc: std.mem.Allocator, hash: hashing.Hash) !?[]u8 {
+    fn fetch(self: *GlobalDedup, allocator: std.mem.Allocator, hash: hashing.Hash) !?[]u8 {
+        if (self.missed_remote.contains(hash)) return null;
         const hex = hashing.toHex(hash);
         const target = try self.client.url("/v1/chunks/default-merkledb/{s}", .{hex});
         defer self.allocator.free(target);
         var req = try self.client.request(.GET, target, null, true, null, true);
         defer req.deinit();
         var response = try req.receiveHead(&.{});
-        if (response.head.status == .not_found) return null;
+        if (response.head.status == .not_found) {
+            if (self.missed_remote.count() < max_missed_remote)
+                try self.missed_remote.put(self.index.allocator, hash, {});
+            return null;
+        }
         if (response.head.status != .ok) return statusError(response.head.status);
-        const bytes = try Client.readResponse(alloc, &response, 80 * 1024 * 1024);
-        errdefer alloc.free(bytes);
-        return bytes;
+        return try Client.readResponse(allocator, &response, 80 * 1024 * 1024);
     }
 };
 
@@ -424,17 +500,18 @@ fn responsePrefix(response: *const std.http.Client.Response, range: ?reconstruct
         if (response.head.status != .ok) return statusError(response.head.status);
         return .{ .skip = 0, .remaining = std.math.maxInt(u64) };
     };
-    const remaining = try rangeLength(requested);
-    const skip = switch (response.head.status) {
-        .ok => requested.start,
-        .partial_content => skip: {
-            const actual = try contentRange(response);
-            if (actual.start != requested.start or actual.end != requested.end) return error.InvalidResponse;
-            break :skip 0;
+    return .{
+        .remaining = try rangeLength(requested),
+        .skip = switch (response.head.status) {
+            .ok => requested.start,
+            .partial_content => skip: {
+                const actual = try contentRange(response);
+                if (actual.start != requested.start or actual.end != requested.end) return error.InvalidResponse;
+                break :skip 0;
+            },
+            else => return statusError(response.head.status),
         },
-        else => return statusError(response.head.status),
     };
-    return .{ .skip = skip, .remaining = remaining };
 }
 
 const ResponseStream = struct {
@@ -800,6 +877,38 @@ test "reconstruction ranges reject inclusive length overflow" {
         .{ .start = 0, .end = std.math.maxInt(u64) },
         1,
     ));
+}
+
+test "GlobalDedup caches remote misses but retries errors for the same hash" {
+    const support = @import("regression_support");
+    const allocator = std.testing.allocator;
+    const responses = [_]support.HttpResponse{
+        .{ .status = .not_found },
+        .{ .status = .internal_server_error },
+        .{ .status = .internal_server_error },
+    };
+    var server = try support.Loopback.init(allocator, std.testing.io, &responses);
+    defer server.deinit();
+    try server.start();
+    var client = try Client.init(allocator, std.testing.io, server.origin, "");
+    defer client.deinit();
+    var global = GlobalDedup{
+        .client = &client,
+        .allocator = allocator,
+        .io = std.testing.io,
+        .index = .init(allocator),
+    };
+    defer global.deinit();
+
+    const missed_hash = hashing.data("missed");
+    const failed_hash = hashing.data("failed");
+    try std.testing.expect((try global.fetch(allocator, missed_hash)) == null);
+    try std.testing.expect(global.missed_remote.contains(missed_hash));
+    try std.testing.expect((try global.fetch(allocator, missed_hash)) == null);
+    try std.testing.expectError(error.ServerError, global.fetch(allocator, failed_hash));
+    try std.testing.expect(!global.missed_remote.contains(failed_hash));
+    try std.testing.expectError(error.ServerError, global.fetch(allocator, failed_hash));
+    try server.finish(3);
 }
 
 test "malformed CAS responses are rejected" {

@@ -33,34 +33,38 @@ pub const Source = struct {
 
     pub fn query(self: Source, allocator: std.mem.Allocator, hashes: []const hashing.Hash) !?Match {
         if (hashes.len == 0 or hashes.len > std.math.maxInt(u32)) return error.InvalidDedupQuery;
-        const result = try self.query_fn(self.context, allocator, hashes);
-        if (result) |found| {
+        if (try self.query_fn(self.context, allocator, hashes)) |found| {
             var match = found;
             errdefer match.deinit(allocator);
             const invalid = match.nodes.len == 0 or match.nodes.len > hashes.len or
                 match.nodes.len > std.math.maxInt(u32) - match.chunk_index_start;
-            if (invalid) {
-                return error.InvalidDedupMatch;
-            }
+            if (invalid) return error.InvalidDedupMatch;
             _ = try match.unpackedBytes();
             for (match.nodes, hashes[0..match.nodes.len]) |node, expected| {
                 if (node.size == 0 or !hashing.eql(node.hash, expected)) {
                     return error.InvalidDedupMatch;
                 }
             }
+            return match;
         }
-        return result;
+        return null;
     }
 };
 
 /// Matches chunk hashes with each shard's HMAC key
 pub const ShardIndex = struct {
     shards: std.ArrayList(Shard) = .empty,
+    max_bytes: usize = 256 * 1024 * 1024,
+    total_bytes: usize = 0,
 
     const Shard = struct {
         bytes: []u8,
         reader: shard.Reader,
     };
+
+    pub fn init(max_bytes: usize) ShardIndex {
+        return .{ .max_bytes = max_bytes };
+    }
 
     pub fn deinit(self: *ShardIndex, allocator: std.mem.Allocator) void {
         for (self.shards.items) |item| allocator.free(item.bytes);
@@ -68,15 +72,23 @@ pub const ShardIndex = struct {
         self.* = .{};
     }
 
-    /// Takes ownership of `bytes`, even on failure. Returns false if expired
+    /// Takes ownership of `bytes`, even on failure. Returns false if expired or oversized
     pub fn addOwned(self: *ShardIndex, allocator: std.mem.Allocator, bytes: []u8, now: i64) !bool {
-        errdefer allocator.free(bytes);
+        var owned = true;
+        defer if (owned) allocator.free(bytes);
+        if (self.max_bytes != 0 and bytes.len > self.max_bytes) return false;
         const reader = try shard.Reader.init(bytes);
-        if (reader.footer.expiry != 0 and reader.footer.expiry <= now) {
-            allocator.free(bytes);
-            return false;
+        if (reader.footer.expiry != 0 and reader.footer.expiry <= now) return false;
+        if (self.max_bytes != 0) {
+            while (bytes.len > self.max_bytes - self.total_bytes) {
+                const oldest = self.shards.orderedRemove(0);
+                self.total_bytes -= oldest.bytes.len;
+                allocator.free(oldest.bytes);
+            }
         }
         try self.shards.append(allocator, .{ .bytes = bytes, .reader = reader });
+        self.total_bytes += bytes.len;
+        owned = false;
         return true;
     }
 
@@ -141,7 +153,7 @@ pub const SessionIndex = struct {
         return self.global.addOwned(self.allocator, bytes, now);
     }
 
-    /// Copies the chunk metadata so it can outlive the publisher's current Xorb
+    /// Copies the metadata so it outlives the current Xorb
     pub fn addXorb(self: *SessionIndex, object: shard.Xorb) !void {
         const xorb_index = self.xorbs.items.len;
         const chunks = try self.allocator.dupe(shard.Chunk, object.chunks);
@@ -314,6 +326,97 @@ test "global shard lookup falls back to footerless chunk records" {
     var match = (try index.find(allocator, &.{chunk_hash})).?;
     defer match.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 5), match.nodes[0].size);
+}
+
+test "ShardIndex evicts oldest shards within its byte limit" {
+    const allocator = std.testing.allocator;
+    const hashes = [_]hashing.Hash{ hashing.data("first"), hashing.data("second") };
+    const bytes_0 = try shard.serialize(allocator, &.{}, &.{.{
+        .hash = hashes[0],
+        .chunks = &.{.{
+            .hash = hashes[0],
+            .byte_range_start = 0,
+            .unpacked_segment_bytes = 1,
+        }},
+        .raw_size = 1,
+        .serialized_size = 1,
+    }});
+    const bytes_1 = try shard.serialize(allocator, &.{}, &.{.{
+        .hash = hashes[1],
+        .chunks = &.{.{
+            .hash = hashes[1],
+            .byte_range_start = 0,
+            .unpacked_segment_bytes = 1,
+        }},
+        .raw_size = 1,
+        .serialized_size = 1,
+    }});
+    const sizes = [2]usize{ bytes_0.len, bytes_1.len };
+
+    var index = ShardIndex.init(sizes[0] + sizes[1] - 1);
+    defer index.deinit(allocator);
+    try std.testing.expect(try index.addOwned(allocator, bytes_0, 0));
+    try std.testing.expect(try index.addOwned(allocator, bytes_1, 0));
+    try std.testing.expectEqual(@as(usize, 1), index.shards.items.len);
+    try std.testing.expectEqual(sizes[1], index.total_bytes);
+    try std.testing.expect((try index.find(allocator, hashes[0..1])) == null);
+    var match = (try index.find(allocator, hashes[1..2])).?;
+    defer match.deinit(allocator);
+    try std.testing.expectEqual(hashes[1], match.xorb_hash);
+}
+
+test "ShardIndex rejects oversized input and consumes it on allocation failure" {
+    const support = @import("regression_support");
+    const chunk = shard.Chunk{
+        .hash = hashing.data("chunk"),
+        .byte_range_start = 0,
+        .unpacked_segment_bytes = 1,
+    };
+    const metadata = shard.Xorb{
+        .hash = hashing.data("xorb"),
+        .chunks = &.{chunk},
+        .raw_size = 1,
+        .serialized_size = 1,
+    };
+
+    var oversized_tracker = support.TrackingAllocator{ .backing = std.testing.allocator };
+    defer oversized_tracker.deinit();
+    const operation = oversized_tracker.allocator();
+    const oversized = try shard.serialize(operation, &.{}, &.{metadata});
+    var bounded = ShardIndex.init(1);
+    defer bounded.deinit(operation);
+    try std.testing.expect(!try bounded.addOwned(operation, oversized, 0));
+    try std.testing.expectEqual(@as(usize, 0), bounded.shards.items.len);
+    try std.testing.expectEqual(@as(usize, 0), oversized_tracker.outstanding());
+
+    const baseline = try shard.serialize(std.testing.allocator, &.{}, &.{metadata});
+    defer std.testing.allocator.free(baseline);
+    const baseline_size = baseline.len;
+    var fail_at: usize = 0;
+    while (true) : (fail_at += 1) {
+        var tracker = support.TrackingAllocator{ .backing = std.testing.allocator, .fail_at = fail_at };
+        defer tracker.deinit();
+        const alloc = tracker.allocator();
+        const bytes = shard.serialize(alloc, &.{}, &.{metadata}) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            continue;
+        };
+        const added = blk: {
+            var index = ShardIndex.init(2 * baseline_size);
+            defer index.deinit(alloc);
+            break :blk index.addOwned(alloc, bytes, 0);
+        };
+        if (added) |value| {
+            try std.testing.expect(value);
+            try std.testing.expectEqual(@as(usize, 0), tracker.outstanding());
+            try std.testing.expectEqual(@as(usize, 0), tracker.duplicate_frees);
+            try std.testing.expectEqual(@as(usize, 0), tracker.invalid_frees);
+            break;
+        } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+        try std.testing.expectEqual(@as(usize, 0), tracker.outstanding());
+        try std.testing.expectEqual(@as(usize, 0), tracker.duplicate_frees);
+        try std.testing.expectEqual(@as(usize, 0), tracker.invalid_frees);
+    }
 }
 
 test "global dedup eligibility uses the last little-endian word" {
