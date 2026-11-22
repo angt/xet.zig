@@ -431,6 +431,18 @@ pub const Reader = struct {
         return null;
     }
 
+    pub fn findChunks(self: Reader, hash: hashing.Hash) !ChunkLookup {
+        var low: usize = 0;
+        var high = self.footer.chunk_count;
+        const needle = hashing.truncated(hash);
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            const offset = self.footer.chunk_lookup_offset + 16 * middle;
+            if (try readU64(self.data, offset) < needle) low = middle + 1 else high = middle;
+        }
+        return .{ .reader = self, .hash = hash, .index = low };
+    }
+
     pub fn fileAt(self: Reader, index: u32) !FileInfo {
         const offset = try offsetAfter(self.footer.file_info_offset, index, entry_size);
         if (offset >= self.footer.xorb_info_offset) return error.InvalidOffset;
@@ -604,6 +616,36 @@ pub const FileInfo = struct {
     }
 };
 
+pub const ChunkLookup = struct {
+    reader: Reader,
+    hash: hashing.Hash,
+    index: usize,
+
+    pub fn next(self: *ChunkLookup) !?ChunkInfo {
+        while (self.index < self.reader.footer.chunk_count) : (self.index += 1) {
+            const offset = self.reader.footer.chunk_lookup_offset + 16 * self.index;
+            if (try readU64(self.reader.data, offset) != hashing.truncated(self.hash)) return null;
+            const xorb_index = try readU32(self.reader.data, offset + 8);
+            const chunk_index = try readU32(self.reader.data, offset + 12);
+            const object = try self.reader.xorbAt(xorb_index);
+            const chunk = try object.chunk(chunk_index);
+            if (hashing.eql(chunk.hash, self.hash)) {
+                self.index += 1;
+                return .{
+                    .object = object,
+                    .index = chunk_index,
+                };
+            }
+        }
+        return null;
+    }
+};
+
+pub const ChunkInfo = struct {
+    object: XorbInfo,
+    index: u32,
+};
+
 pub const XorbInfo = struct {
     reader: Reader,
     offset: usize,
@@ -676,6 +718,13 @@ test "complete shard round trip with sorted lookups" {
     try std.testing.expectEqual(checks[0], try info.verification(0));
     const object = try reader.xorbAt(0);
     try std.testing.expectEqual(chunk_hash, (try object.chunk(0)).hash);
+    var lookup = try reader.findChunks(chunk_hash);
+    const located = (try lookup.next()).?;
+    try std.testing.expectEqual(object_hash, located.object.hash);
+    try std.testing.expectEqual(@as(u32, 0), located.index);
+    try std.testing.expect((try lookup.next()) == null);
+    var missing = try reader.findChunks(hashing.data("missing"));
+    try std.testing.expect((try missing.next()) == null);
     try std.testing.expect((try reader.findFile(hashing.data("missing"))) == null);
 }
 

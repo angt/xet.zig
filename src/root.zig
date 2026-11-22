@@ -24,6 +24,7 @@ pub const publish = @import("store.zig").publish;
 pub const DedupSource = @import("dedup.zig").Source;
 pub const DedupMatch = @import("dedup.zig").Match;
 pub const DedupShardIndex = @import("dedup.zig").ShardIndex;
+pub const DedupSessionIndex = @import("dedup.zig").SessionIndex;
 pub const UploadPlan = @import("store.zig").Plan;
 pub const reconstruction = @import("reconstruction.zig");
 pub const http = @import("http.zig");

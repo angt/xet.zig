@@ -302,6 +302,7 @@ const GlobalDedup = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     index: dedup.SessionIndex,
+    first_query: bool = true,
 
     fn deinit(self: *GlobalDedup) void {
         self.index.deinit();
@@ -318,8 +319,11 @@ const GlobalDedup = struct {
 
     fn query(raw: *anyopaque, alloc: std.mem.Allocator, hashes: []const hashing.Hash) !?dedup.Match {
         const self: *GlobalDedup = @ptrCast(@alignCast(raw));
+        const allow_remote = self.first_query or dedup.eligible(hashes[0]);
+        self.first_query = false;
         const local = self.index.source();
         if (try local.query(alloc, hashes)) |match| return match;
+        if (!allow_remote) return null;
         const bytes = self.fetch(alloc, hashes[0]) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => null,
@@ -328,10 +332,7 @@ const GlobalDedup = struct {
             const now = std.Io.Clock.real.now(self.io).nanoseconds;
             const secs = @divFloor(now, std.time.ns_per_s);
             _ = self.index.addGlobalOwned(owned, @intCast(secs)) catch |err| switch (err) {
-                error.OutOfMemory => {
-                    alloc.free(owned);
-                    return err;
-                },
+                error.OutOfMemory => return err,
                 else => false,
             };
         }

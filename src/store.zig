@@ -354,13 +354,12 @@ pub const Publisher = struct {
     size: u64 = 0,
     xorb_count: u64 = 0,
     finished: bool = false,
-    chunk_index: u64 = 0,
+    has_complete_sha256: bool = true,
     reused_xorb: ?hashing.Hash = null,
     reused_next_chunk: u32 = 0,
     reused_verification: std.crypto.hash.Blake3 = .init(.{ .key = constants.verification_key }),
     pending_chunks: std.ArrayList(chunker.Chunk) = .empty,
     pending_hashes: std.ArrayList(hashing.Hash) = .empty,
-    pending_query: bool = false,
 
     /// Borrows the dedup source, listener, and callback metadata
     pub fn init(allocator: std.mem.Allocator, destination: Store, options: PublisherOptions) !Publisher {
@@ -411,7 +410,10 @@ pub const Publisher = struct {
         try self.processPending();
         try self.flushXorb();
         const file_hash = try self.file_nodes.fileHash();
-        const sha256 = hashing.fromStandard(self.file_sha256.finalResult());
+        const sha256 = if (self.has_complete_sha256)
+            hashing.fromStandard(self.file_sha256.finalResult())
+        else
+            null;
         const segments = try self.segments.toOwnedSlice(self.allocator);
         errdefer self.allocator.free(segments);
         const checks = try self.checks.toOwnedSlice(self.allocator);
@@ -433,16 +435,42 @@ pub const Publisher = struct {
         };
     }
 
-    /// References existing chunks. `nodes` must exactly match the Xorb range
+    /// References existing chunks. `nodes` must exactly match the Xorb range.
+    /// Direct reuse omits SHA-256 metadata because the original bytes are unavailable.
     pub fn reuse(
         self: *Publisher,
         object_hash: hashing.Hash,
         chunk_index_start: u32,
         nodes: []const hashing.Node,
     ) !void {
+        if (self.finished) return error.AlreadyFinished;
+        try validateReuse(nodes, chunk_index_start);
+        const final = try self.chunker.finish(self.allocator);
+        if (final.chunk) |chunk| try self.addChunk(chunk);
+        try self.processPending();
+        self.has_complete_sha256 = false;
+        try self.appendReuse(object_hash, chunk_index_start, nodes);
+    }
+
+    fn validateReuse(nodes: []const hashing.Node, chunk_index_start: u32) !void {
         if (nodes.len == 0 or nodes.len > std.math.maxInt(u32) - chunk_index_start) {
             return error.InvalidDedupMatch;
         }
+        var total: u64 = 0;
+        for (nodes) |node| {
+            if (node.size == 0 or node.size > constants.max_chunk_size) return error.InvalidDedupMatch;
+            total = std.math.add(u64, total, node.size) catch return error.FileTooLarge;
+            if (total > std.math.maxInt(u32)) return error.InvalidDedupMatch;
+        }
+    }
+
+    fn appendReuse(
+        self: *Publisher,
+        object_hash: hashing.Hash,
+        chunk_index_start: u32,
+        nodes: []const hashing.Node,
+    ) !void {
+        try validateReuse(nodes, chunk_index_start);
         const continues = if (self.reused_xorb) |hash|
             hashing.eql(hash, object_hash) and self.reused_next_chunk == chunk_index_start
         else
@@ -487,14 +515,8 @@ pub const Publisher = struct {
     }
 
     fn addChunk(self: *Publisher, chunk: chunker.Chunk) !void {
-        if (self.options.dedup_source) |source| {
-            if (self.pending_chunks.items.len == 0) {
-                try self.buffer(chunk);
-                return;
-            }
-            if (self.pending_chunks.items.len == 64 or dedup.eligible(chunk.hash)) {
-                try self.processBatch(source);
-            }
+        if (self.options.dedup_source != null) {
+            if (self.pending_chunks.items.len == 64) try self.processPending();
             try self.buffer(chunk);
             return;
         }
@@ -507,8 +529,6 @@ pub const Publisher = struct {
         try self.pending_chunks.append(self.allocator, .{ .data = data, .hash = chunk.hash });
         errdefer self.pending_chunks.shrinkRetainingCapacity(self.pending_chunks.items.len - 1);
         try self.pending_hashes.append(self.allocator, chunk.hash);
-        if (self.pending_chunks.items.len == 1) self.pending_query = self.chunk_index == 0 or dedup.eligible(chunk.hash);
-        self.chunk_index += 1;
     }
 
     fn dropPending(self: *Publisher, count: usize) void {
@@ -519,43 +539,20 @@ pub const Publisher = struct {
         }
         self.pending_chunks.shrinkRetainingCapacity(self.pending_chunks.items.len - count);
         self.pending_hashes.shrinkRetainingCapacity(self.pending_hashes.items.len - count);
-        self.pending_query = self.pending_chunks.items.len != 0 and dedup.eligible(self.pending_hashes.items[0]);
     }
 
     fn processPending(self: *Publisher) !void {
-        if (self.pending_chunks.items.len == 0) return;
-        const source = self.options.dedup_source.?;
-        if (self.pending_query) {
-            try self.processBatch(source);
-        } else {
-            while (self.pending_chunks.items.len != 0) {
-                try self.addNew(self.pending_chunks.items[0]);
-                self.dropPending(1);
-            }
-        }
-        std.debug.assert(self.pending_chunks.items.len == 0);
+        const source = self.options.dedup_source orelse return;
+        while (self.pending_chunks.items.len != 0) try self.processBatch(source);
     }
 
     fn processBatch(self: *Publisher, source: DedupSource) !void {
         const found = try source.query(self.allocator, self.pending_hashes.items);
-        const consumed = if (found) |located| blk: {
+        if (found) |located| {
             var match = located;
             defer match.deinit(self.allocator);
-            try self.reuse(match.xorb_hash, match.chunk_index_start, match.nodes);
-            break :blk match.nodes.len;
-        } else 0;
-        if (consumed != 0) {
-            self.dropPending(consumed);
-            if (self.pending_chunks.items.len != 0) {
-                if (self.pending_query) {
-                    try self.processBatch(source);
-                } else {
-                    while (self.pending_chunks.items.len != 0) {
-                        try self.addNew(self.pending_chunks.items[0]);
-                        self.dropPending(1);
-                    }
-                }
-            }
+            try self.appendReuse(match.xorb_hash, match.chunk_index_start, match.nodes);
+            self.dropPending(match.nodes.len);
             return;
         }
         const first = self.pending_chunks.items[0];

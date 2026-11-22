@@ -32,9 +32,8 @@ pub const Source = struct {
     ) anyerror!?Match,
 
     pub fn query(self: Source, allocator: std.mem.Allocator, hashes: []const hashing.Hash) !?Match {
-        if (hashes.len == 0) return error.InvalidDedupQuery;
+        if (hashes.len == 0 or hashes.len > std.math.maxInt(u32)) return error.InvalidDedupQuery;
         const result = try self.query_fn(self.context, allocator, hashes);
-        if (hashes.len > std.math.maxInt(u32)) return error.InvalidDedupQuery;
         if (result) |found| {
             var match = found;
             errdefer match.deinit(allocator);
@@ -113,12 +112,17 @@ pub fn eligible(chunk_hash: hashing.Hash) bool {
 pub const SessionIndex = struct {
     allocator: std.mem.Allocator,
     entries: std.AutoHashMapUnmanaged(hashing.Hash, Location) = .empty,
+    xorbs: std.ArrayList(Xorb) = .empty,
     global: ShardIndex = .{},
 
+    const Xorb = struct {
+        hash: hashing.Hash,
+        chunks: []shard.Chunk,
+    };
+
     const Location = struct {
-        xorb_hash: hashing.Hash,
+        xorb_index: usize,
         chunk_index: u32,
-        chunk_size: u32,
     };
 
     pub fn init(allocator: std.mem.Allocator) SessionIndex {
@@ -127,6 +131,8 @@ pub const SessionIndex = struct {
 
     pub fn deinit(self: *SessionIndex) void {
         self.entries.deinit(self.allocator);
+        for (self.xorbs.items) |object| self.allocator.free(object.chunks);
+        self.xorbs.deinit(self.allocator);
         self.global.deinit(self.allocator);
         self.* = undefined;
     }
@@ -135,13 +141,20 @@ pub const SessionIndex = struct {
         return self.global.addOwned(self.allocator, bytes, now);
     }
 
+    /// Copies the chunk metadata so it can outlive the publisher's current Xorb
     pub fn addXorb(self: *SessionIndex, object: shard.Xorb) !void {
-        for (object.chunks, 0..) |chunk, index| {
-            try self.entries.put(self.allocator, chunk.hash, .{
-                .xorb_hash = object.hash,
+        const xorb_index = self.xorbs.items.len;
+        const chunks = try self.allocator.dupe(shard.Chunk, object.chunks);
+        errdefer self.allocator.free(chunks);
+        try self.xorbs.ensureUnusedCapacity(self.allocator, 1);
+        errdefer _ = self.xorbs.pop();
+        try self.entries.ensureUnusedCapacity(self.allocator, @intCast(chunks.len));
+        self.xorbs.appendAssumeCapacity(.{ .hash = object.hash, .chunks = chunks });
+        for (chunks, 0..) |chunk, index| {
+            self.entries.getOrPutAssumeCapacity(chunk.hash).value_ptr.* = .{
+                .xorb_index = xorb_index,
                 .chunk_index = @intCast(index),
-                .chunk_size = chunk.unpacked_segment_bytes,
-            });
+            };
         }
     }
 
@@ -153,11 +166,19 @@ pub const SessionIndex = struct {
         const self: *SessionIndex = @ptrCast(@alignCast(raw));
         const first = self.entries.get(hashes[0]) orelse
             return self.global.find(allocator, hashes);
-        const nodes = try allocator.alloc(hashing.Node, 1);
-        nodes[0] = .{ .hash = hashes[0], .size = first.chunk_size };
+        const object = self.xorbs.items[first.xorb_index];
+        var count: usize = 1;
+        while (count < hashes.len and first.chunk_index + count < object.chunks.len) : (count += 1) {
+            const next = object.chunks[first.chunk_index + count];
+            if (!hashing.eql(next.hash, hashes[count])) break;
+        }
+        const nodes = try allocator.alloc(hashing.Node, count);
+        for (nodes, object.chunks[first.chunk_index..][0..count]) |*node, chunk| {
+            node.* = .{ .hash = chunk.hash, .size = chunk.unpacked_segment_bytes };
+        }
         return .{
             .nodes = nodes,
-            .xorb_hash = first.xorb_hash,
+            .xorb_hash = object.hash,
             .chunk_index_start = first.chunk_index,
         };
     }
@@ -170,6 +191,18 @@ const Located = struct {
 };
 
 fn findInShard(reader: shard.Reader, hashes: []const hashing.Hash) ?Located {
+    const target = keyed(reader.footer.chunk_hash_key, hashes[0]);
+    if (reader.footer.chunk_lookup_offset != reader.footer.footer_offset) {
+        var best: ?Located = null;
+        var lookup = reader.findChunks(target) catch return null;
+        while (lookup.next() catch return null) |first| {
+            const located = contiguousRun(reader, first.object, first.index, hashes) orelse return null;
+            if (best == null or located.count > best.?.count) best = located;
+            if (best.?.count == hashes.len) break;
+        }
+        return best;
+    }
+
     var best: ?Located = null;
     var record: u32 = 0;
     for (0..reader.footer.xorb_count) |_| {
@@ -177,27 +210,52 @@ fn findInShard(reader: shard.Reader, hashes: []const hashing.Hash) ?Located {
         record += object.count + 1;
         for (0..object.count) |i| {
             const first = object.chunk(@intCast(i)) catch return null;
-            const hash = keyed(reader.footer.chunk_hash_key, hashes[0]);
-            if (!hashing.eql(hash, first.hash)) continue;
-            var count: u32 = 1;
-            while (count < hashes.len and i + count < object.count) : (count += 1) {
-                const next = object.chunk(@intCast(i + count)) catch return null;
-                const next_hash = keyed(reader.footer.chunk_hash_key, hashes[count]);
-                if (!hashing.eql(next_hash, next.hash)) break;
+            if (!hashing.eql(target, first.hash)) continue;
+            if (contiguousRun(reader, object, @intCast(i), hashes)) |located| {
+                if (best == null or located.count > best.?.count) best = located;
             }
-            if (best == null or count > best.?.count) best = .{
-                .object = object,
-                .chunk_index = @intCast(i),
-                .count = count,
-            };
         }
     }
     return best;
 }
 
+fn contiguousRun(reader: shard.Reader, object: shard.XorbInfo, start: u32, hashes: []const hashing.Hash) ?Located {
+    var count: u32 = 1;
+    while (count < hashes.len and start + count < object.count) : (count += 1) {
+        const next = object.chunk(start + count) catch return null;
+        const next_hash = keyed(reader.footer.chunk_hash_key, hashes[count]);
+        if (!hashing.eql(next_hash, next.hash)) break;
+    }
+    return .{ .object = object, .chunk_index = start, .count = count };
+}
+
 fn keyed(key: hashing.Hash, hash: hashing.Hash) hashing.Hash {
     if (hashing.eql(key, hashing.zero)) return hash;
     return hashing.keyed(key, &hash);
+}
+
+test "session lookup owns Xorb metadata and returns contiguous runs" {
+    const allocator = std.testing.allocator;
+    const hashes = [_]hashing.Hash{ hashing.data("A"), hashing.data("B"), hashing.data("C") };
+    var chunks: [3]shard.Chunk = undefined;
+    for (&chunks, hashes, 0..) |*chunk, hash, index| chunk.* = .{
+        .hash = hash,
+        .byte_range_start = @intCast(index),
+        .unpacked_segment_bytes = 1,
+    };
+    var session = SessionIndex.init(allocator);
+    defer session.deinit();
+    try session.addXorb(.{
+        .hash = hashing.data("xorb"),
+        .chunks = &chunks,
+        .raw_size = 3,
+        .serialized_size = 3,
+    });
+    @memset(&chunks, std.mem.zeroes(shard.Chunk));
+    var match = (try session.source().query(allocator, &hashes)).?;
+    defer match.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 3), match.nodes.len);
+    try std.testing.expectEqual(@as(u32, 3), try match.unpackedBytes());
 }
 
 test "global shard lookup honors HMAC keys and contiguous runs" {
@@ -231,6 +289,32 @@ test "global shard lookup honors HMAC keys and contiguous runs" {
     defer partial_match.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 1), partial_match.nodes.len);
     try std.testing.expect((try index.find(allocator, &.{hashing.data("unknown")})) == null);
+}
+
+test "global shard lookup falls back to footerless chunk records" {
+    const allocator = std.testing.allocator;
+    const chunk_hash = hashing.data("chunk");
+    const bytes = try shard.serialize(allocator, &.{}, &.{.{
+        .hash = hashing.data("xorb"),
+        .chunks = &.{.{
+            .hash = chunk_hash,
+            .byte_range_start = 0,
+            .unpacked_segment_bytes = 5,
+        }},
+        .raw_size = 5,
+        .serialized_size = 5,
+    }});
+    defer allocator.free(bytes);
+    const reader = try shard.Reader.init(bytes);
+    const footerless = try allocator.dupe(u8, bytes[0..reader.footer.file_lookup_offset]);
+    std.mem.writeInt(u64, footerless[40..48], 0, .little);
+
+    var index: ShardIndex = .{};
+    defer index.deinit(allocator);
+    try std.testing.expect(try index.addOwned(allocator, footerless, 0));
+    var match = (try index.find(allocator, &.{chunk_hash})).?;
+    defer match.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 5), match.nodes[0].size);
 }
 
 test "global dedup eligibility uses the last little-endian word" {
