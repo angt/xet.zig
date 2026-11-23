@@ -63,9 +63,11 @@ pub const PublisherOptions = struct {
     }
 
     fn validate(self: PublisherOptions) !void {
-        if (self.max_xorb_size == 0 or self.max_xorb_size > constants.max_xorb_size or
-            self.max_xorb_chunks == 0 or self.max_xorb_chunks > constants.max_xorb_chunks)
-            return error.InvalidOptions;
+        return PackOptions.validate(.{
+            .compression = self.compression,
+            .max_xorb_size = self.max_xorb_size,
+            .max_xorb_chunks = self.max_xorb_chunks,
+        });
     }
 };
 
@@ -92,15 +94,14 @@ pub fn pack(
     try options.validate();
     const chunks = try chunker.chunkBuffer(allocator, input);
     defer allocator.free(chunks);
-    const nodes = try allocator.alloc(hashing.Node, chunks.len);
-    defer allocator.free(nodes);
     const source_chunks = try allocator.alloc(xorb.Chunk, chunks.len);
     defer allocator.free(source_chunks);
-    for (chunks, nodes, source_chunks) |chunk, *node, *source| {
-        node.* = .{ .hash = chunk.hash, .size = chunk.data.len };
+    var file_nodes: hashing.Aggregator = .{};
+    for (chunks, source_chunks) |chunk, *source| {
         source.* = .{ .data = chunk.data, .hash = chunk.hash };
+        try file_nodes.add(.{ .hash = chunk.hash, .size = chunk.data.len });
     }
-    const file_hash = try hashing.file(allocator, nodes);
+    const file_hash = try file_nodes.fileHash();
     var sha256: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(input, &sha256, .{});
 
@@ -322,8 +323,7 @@ pub const Plan = struct {
     }
 
     pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
-        allocator.free(self.file.segments);
-        if (self.file.verification.len != 0) allocator.free(self.file.verification);
+        freeDecodedFile(allocator, self.file);
         for (self.new_xorbs) |object| allocator.free(object.chunks);
         allocator.free(self.new_xorbs);
         self.* = undefined;
@@ -362,9 +362,7 @@ pub const BatchPublisher = struct {
         self.* = undefined;
     }
 
-    /// Moves `plan` into the batch on success, leaving it empty. On failure,
-    /// the caller retains ownership of the unchanged plan. All allocations owned
-    /// by `plan` must have been made with the allocator passed to `init`.
+    /// Success empties `plan`; failure preserves its batch-allocator-owned allocations
     pub fn append(self: *BatchPublisher, plan: *Plan) !void {
         if (self.finished) return error.AlreadyFinished;
         try self.plans.ensureUnusedCapacity(self.allocator, 1);
@@ -415,9 +413,9 @@ pub const Publisher = struct {
     size: u64 = 0,
     xorb_count: u64 = 0,
     finished: bool = false,
+    failed: bool = false,
     has_complete_sha256: bool = true,
     reused_xorb: ?hashing.Hash = null,
-    reused_next_chunk: u32 = 0,
     reused_verification: std.crypto.hash.Blake3 = .init(.{ .key = constants.verification_key }),
     pending_chunks: [dedup_window]chunker.Chunk = undefined,
     pending_head: usize = 0,
@@ -442,14 +440,20 @@ pub const Publisher = struct {
         self.checks.deinit(self.allocator);
         for (self.xorbs.items) |object| self.allocator.free(object.chunks);
         self.xorbs.deinit(self.allocator);
-        for (0..self.pending_len) |index| {
-            const chunk = self.pending_chunks[(self.pending_head + index) % dedup_window];
-            self.allocator.free(chunk.data);
-        }
+        self.dropPending(self.pending_len);
     }
 
+    /// An operational failure consumes an unspecified input prefix and makes the publisher terminal
     pub fn write(self: *Publisher, input: []const u8) !void {
+        if (self.failed) return error.WriteFailed;
         if (self.finished) return error.AlreadyFinished;
+        self.writeFallible(input) catch |err| {
+            self.failed = true;
+            return err;
+        };
+    }
+
+    fn writeFallible(self: *Publisher, input: []const u8) !void {
         self.file_sha256.update(input);
         var remaining = input;
         while (remaining.len != 0) {
@@ -465,6 +469,7 @@ pub const Publisher = struct {
     }
 
     pub fn finishPlan(self: *Publisher) !Plan {
+        if (self.failed) return error.WriteFailed;
         if (self.finished) return error.AlreadyFinished;
         self.finished = true;
         const final = try self.chunker.finish(self.allocator);
@@ -497,16 +502,50 @@ pub const Publisher = struct {
         };
     }
 
-    /// References existing chunks. `nodes` must exactly match the Xorb range.
-    /// Direct reuse omits SHA-256 metadata because the original bytes are unavailable.
+    /// `nodes` must match the Xorb range because direct reuse omits SHA-256 metadata
     pub fn reuse(
         self: *Publisher,
         object_hash: hashing.Hash,
         chunk_index_start: u32,
         nodes: []const hashing.Node,
     ) !void {
+        if (self.failed) return error.WriteFailed;
         if (self.finished) return error.AlreadyFinished;
-        try validateReuse(nodes, chunk_index_start);
+        const byte_total = try validateReuse(nodes, chunk_index_start);
+        var accepted = self.size;
+        if (!self.chunker.returned_pending) {
+            accepted = std.math.add(u64, accepted, self.chunker.pending.items.len) catch
+                return error.FileTooLarge;
+        }
+        for (0..self.pending_len) |index| {
+            const chunk = self.pending_chunks[(self.pending_head + index) % dedup_window];
+            accepted = std.math.add(u64, accepted, chunk.data.len) catch return error.FileTooLarge;
+        }
+        accepted = std.math.add(u64, accepted, byte_total) catch return error.FileTooLarge;
+        const continues = self.reuseContinues(object_hash, chunk_index_start);
+        const buffered_new = self.serializer.chunks.items.len != 0 or self.chunker.pending.items.len != 0;
+        const uninterrupted = self.pending_len == 0 and !buffered_new;
+        if (continues and uninterrupted) {
+            const last = self.segments.items[self.segments.items.len - 1];
+            if (last.unpacked_segment_bytes > std.math.maxInt(u32) - byte_total) {
+                return error.InvalidDedupMatch;
+            }
+        }
+        if (self.pending_len == 0 and (!continues or buffered_new)) {
+            try self.reserveReuseSegments(1 + @as(usize, @intFromBool(buffered_new)));
+        }
+        self.reuseFallible(object_hash, chunk_index_start, nodes) catch |err| {
+            self.failed = true;
+            return err;
+        };
+    }
+
+    fn reuseFallible(
+        self: *Publisher,
+        object_hash: hashing.Hash,
+        chunk_index_start: u32,
+        nodes: []const hashing.Node,
+    ) !void {
         const final = try self.chunker.finish(self.allocator);
         if (final.chunk) |chunk| try self.addChunk(chunk);
         try self.processPending();
@@ -514,7 +553,14 @@ pub const Publisher = struct {
         try self.appendReuse(object_hash, chunk_index_start, nodes);
     }
 
-    fn validateReuse(nodes: []const hashing.Node, chunk_index_start: u32) !void {
+    fn reuseContinues(self: *const Publisher, object_hash: hashing.Hash, chunk_index_start: u32) bool {
+        const hash = self.reused_xorb orelse return false;
+        if (!hashing.eql(hash, object_hash)) return false;
+        const last = self.segments.items[self.segments.items.len - 1];
+        return last.chunk_index_end == chunk_index_start;
+    }
+
+    fn validateReuse(nodes: []const hashing.Node, chunk_index_start: u32) !u32 {
         if (nodes.len == 0 or nodes.len > std.math.maxInt(u32) - chunk_index_start) {
             return error.InvalidDedupMatch;
         }
@@ -524,6 +570,7 @@ pub const Publisher = struct {
             total = std.math.add(u64, total, node.size) catch return error.FileTooLarge;
             if (total > std.math.maxInt(u32)) return error.InvalidDedupMatch;
         }
+        return @intCast(total);
     }
 
     fn appendReuse(
@@ -532,41 +579,37 @@ pub const Publisher = struct {
         chunk_index_start: u32,
         nodes: []const hashing.Node,
     ) !void {
-        try validateReuse(nodes, chunk_index_start);
-        const continues = if (self.reused_xorb) |hash|
-            hashing.eql(hash, object_hash) and self.reused_next_chunk == chunk_index_start
-        else
-            false;
+        const byte_total = try validateReuse(nodes, chunk_index_start);
+        if (self.size > std.math.maxInt(u64) - @as(u64, byte_total)) return error.FileTooLarge;
+        const continues = self.reuseContinues(object_hash, chunk_index_start);
         if (!continues) {
             try self.flushXorb();
+            try self.reserveReuseSegments(1);
             self.resetReuse();
             self.reused_xorb = object_hash;
-            try self.segments.append(self.allocator, .{
+            self.segments.appendAssumeCapacity(.{
                 .xorb_hash = object_hash,
                 .unpacked_segment_bytes = 0,
                 .chunk_index_start = chunk_index_start,
                 .chunk_index_end = chunk_index_start,
             });
-            try self.checks.append(self.allocator, hashing.zero);
+            self.checks.appendAssumeCapacity(hashing.zero);
             self.xorb_count += 1;
         }
         const last = self.segments.items.len - 1;
-        if (continues) {
-            var bytes = self.segments.items[last].unpacked_segment_bytes;
-            for (nodes) |node| {
-                bytes = std.math.add(u32, bytes, @intCast(node.size)) catch return error.InvalidDedupMatch;
-            }
-        }
+        self.size += byte_total;
         for (nodes) |node| {
-            if (node.size == 0 or node.size > constants.max_chunk_size) return error.InvalidDedupMatch;
             self.reused_verification.update(&node.hash);
-            self.size = std.math.add(u64, self.size, node.size) catch return error.FileTooLarge;
             self.segments.items[last].unpacked_segment_bytes += @intCast(node.size);
             self.segments.items[last].chunk_index_end += 1;
-            self.reused_next_chunk += 1;
             try self.file_nodes.add(node);
         }
         self.checks.items[last] = self.reuseVerification();
+    }
+
+    fn reserveReuseSegments(self: *Publisher, count: usize) !void {
+        try self.segments.ensureUnusedCapacity(self.allocator, count);
+        try self.checks.ensureUnusedCapacity(self.allocator, count);
     }
 
     fn reuseVerification(self: *const Publisher) hashing.Hash {
@@ -578,7 +621,6 @@ pub const Publisher = struct {
 
     fn resetReuse(self: *Publisher) void {
         self.reused_xorb = null;
-        self.reused_next_chunk = 0;
         self.reused_verification = .init(.{ .key = constants.verification_key });
     }
 
@@ -647,10 +689,10 @@ pub const Publisher = struct {
         var object = try self.serializer.finish(self.allocator);
         defer object.deinit(self.allocator);
         const chunk_count = object.chunks.len;
-        const existing = for (self.xorbs.items) |item| {
-            if (hashing.eql(item.hash, object.hash)) break item;
-        } else null;
-        if (existing == null) {
+        const duplicate = for (self.xorbs.items) |item| {
+            if (hashing.eql(item.hash, object.hash)) break true;
+        } else false;
+        if (!duplicate) {
             try self.destination.put(.{
                 .kind = .xorb,
                 .hash = object.hash,
@@ -826,42 +868,42 @@ fn regressionBatchFailure(fail_at: ?usize) !usize {
     var destination = support.MemoryStore{ .allocator = std.testing.allocator };
     defer destination.deinit();
     const allocator = tracker.allocator();
-    var expected_failure = false;
+    var failed = false;
     _ = blk: {
         var batch = BatchPublisher.init(allocator, destination.store());
         defer batch.deinit();
         for ([_][]const u8{ "AAA", "BBB" }) |input| {
             var publisher = Publisher.init(allocator, destination.store(), .{ .compression = .none }) catch |err| {
                 try std.testing.expectEqual(error.OutOfMemory, err);
-                expected_failure = true;
+                failed = true;
                 break :blk;
             };
             defer publisher.deinit();
             publisher.write(input) catch |err| {
                 try std.testing.expectEqual(error.OutOfMemory, err);
-                expected_failure = true;
+                failed = true;
                 break :blk;
             };
             var plan = publisher.finishPlan() catch |err| {
                 try std.testing.expectEqual(error.OutOfMemory, err);
-                expected_failure = true;
+                failed = true;
                 break :blk;
             };
             defer plan.deinit(allocator);
             batch.append(&plan) catch |err| {
                 try std.testing.expectEqual(error.OutOfMemory, err);
-                expected_failure = true;
+                failed = true;
                 break :blk;
             };
         }
         batch.finish() catch |err| {
             try std.testing.expectEqual(error.OutOfMemory, err);
-            expected_failure = true;
+            failed = true;
             break :blk;
         };
         try std.testing.expectEqual(@as(usize, 1), destination.count(.shard));
     };
-    if (fail_at != null) try std.testing.expect(expected_failure);
+    if (fail_at != null) try std.testing.expect(failed);
     try std.testing.expectEqual(@as(usize, 0), tracker.outstanding());
     try std.testing.expectEqual(@as(usize, 0), tracker.duplicate_frees);
     try std.testing.expectEqual(@as(usize, 0), tracker.invalid_frees);
@@ -1010,12 +1052,12 @@ test "repeated xorbs upload once and retain every file segment" {
     @memset(data, 0);
 
     const Context = struct {
-        xorb_uploads: usize = 0,
+        uploads: usize = 0,
         shard_bytes: std.ArrayList(u8) = .empty,
         fn put(raw: *anyopaque, object: Object) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             switch (object.kind) {
-                .xorb => self.xorb_uploads += 1,
+                .xorb => self.uploads += 1,
                 .shard => try self.shard_bytes.appendSlice(std.testing.allocator, object.data),
             }
         }
@@ -1028,7 +1070,7 @@ test "repeated xorbs upload once and retain every file segment" {
     defer publisher.deinit();
     try publisher.write(data);
     const result = try publisher.finish();
-    try std.testing.expectEqual(@as(usize, 1), context.xorb_uploads);
+    try std.testing.expectEqual(@as(usize, 1), context.uploads);
     try std.testing.expectEqual(@as(u64, 4), result.xorb_count);
 
     const reader = try shard.Reader.init(context.shard_bytes.items);

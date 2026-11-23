@@ -72,7 +72,7 @@ pub const ShardIndex = struct {
         self.* = .{};
     }
 
-    /// Takes ownership of `bytes`, even on failure. Returns false if expired or oversized
+    /// Takes ownership of `bytes` even on failure and returns false if expired or oversized
     pub fn addOwned(self: *ShardIndex, allocator: std.mem.Allocator, bytes: []u8, now: i64) !bool {
         var owned = true;
         defer if (owned) allocator.free(bytes);
@@ -120,7 +120,7 @@ pub fn eligible(chunk_hash: hashing.Hash) bool {
     return std.mem.readInt(u64, chunk_hash[24..32], .little) % 1024 == 0;
 }
 
-/// Local metadata uses raw hashes. Global shards retain their HMAC keys
+/// Local metadata uses raw hashes while global shards retain their HMAC keys
 pub const SessionIndex = struct {
     allocator: std.mem.Allocator,
     entries: std.AutoHashMapUnmanaged(hashing.Hash, Location) = .empty,
@@ -155,6 +155,11 @@ pub const SessionIndex = struct {
 
     /// Copies the metadata so it outlives the current Xorb
     pub fn addXorb(self: *SessionIndex, object: shard.Xorb) !void {
+        return self.addXorbTracked(object, null);
+    }
+
+    pub fn addXorbTracked(self: *SessionIndex, object: shard.Xorb, point: ?*Checkpoint) !void {
+        _ = point;
         const xorb_index = self.xorbs.items.len;
         const chunks = try self.allocator.dupe(shard.Chunk, object.chunks);
         errdefer self.allocator.free(chunks);
@@ -166,6 +171,37 @@ pub const SessionIndex = struct {
                 .xorb_index = xorb_index,
                 .chunk_index = @intCast(index),
             };
+        }
+    }
+
+    pub const Checkpoint = struct {
+        xorb_count: usize,
+
+        pub fn deinit(self: *Checkpoint, allocator: std.mem.Allocator) void {
+            _ = allocator;
+            self.* = undefined;
+        }
+    };
+
+    pub fn checkpoint(self: *const SessionIndex) Checkpoint {
+        return .{ .xorb_count = self.xorbs.items.len };
+    }
+
+    pub fn rollback(self: *SessionIndex, checkpoint_point: *?Checkpoint) void {
+        const point = checkpoint_point.* orelse return;
+        checkpoint_point.* = null;
+        while (self.xorbs.items.len > point.xorb_count) {
+            const object = self.xorbs.pop().?;
+            self.allocator.free(object.chunks);
+        }
+        self.entries.clearRetainingCapacity();
+        for (self.xorbs.items, 0..) |object, xorb_index| {
+            for (object.chunks, 0..) |chunk, chunk_index| {
+                self.entries.getOrPutAssumeCapacity(chunk.hash).value_ptr.* = .{
+                    .xorb_index = xorb_index,
+                    .chunk_index = @intCast(chunk_index),
+                };
+            }
         }
     }
 
@@ -267,6 +303,44 @@ test "session lookup owns Xorb metadata and returns contiguous runs" {
     defer match.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 3), match.nodes.len);
     try std.testing.expectEqual(@as(u32, 3), try match.unpackedBytes());
+}
+
+test "session rollback restores shadowed mappings and removes new chunks" {
+    const allocator = std.testing.allocator;
+    const shared_hash = hashing.data("shared");
+    const new_hash = hashing.data("new");
+    const old_hash = hashing.data("old xorb");
+    const new_xorb_hash = hashing.data("new xorb");
+    var session = SessionIndex.init(allocator);
+    defer session.deinit();
+    try session.addXorb(.{
+        .hash = old_hash,
+        .chunks = &.{.{ .hash = shared_hash, .byte_range_start = 0, .unpacked_segment_bytes = 1 }},
+        .raw_size = 1,
+        .serialized_size = 1,
+    });
+    var point = session.checkpoint();
+    var active = true;
+    defer if (active) point.deinit(allocator);
+    try session.addXorbTracked(.{
+        .hash = new_xorb_hash,
+        .chunks = &.{
+            .{ .hash = shared_hash, .byte_range_start = 0, .unpacked_segment_bytes = 2 },
+            .{ .hash = new_hash, .byte_range_start = 0, .unpacked_segment_bytes = 3 },
+        },
+        .raw_size = 5,
+        .serialized_size = 5,
+    }, &point);
+    var optional_point: ?SessionIndex.Checkpoint = point;
+    session.rollback(&optional_point);
+    active = false;
+
+    var match = (try session.source().query(allocator, &.{shared_hash})).?;
+    defer match.deinit(allocator);
+    try std.testing.expectEqual(old_hash, match.xorb_hash);
+    try std.testing.expectEqual(@as(u64, 1), match.nodes[0].size);
+    try std.testing.expect((try session.source().query(allocator, &.{new_hash})) == null);
+    try std.testing.expectEqual(@as(usize, 1), session.xorbs.items.len);
 }
 
 test "global shard lookup honors HMAC keys and contiguous runs" {

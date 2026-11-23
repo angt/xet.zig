@@ -610,6 +610,76 @@ test "Client.upload reuses a server-provided global chunk match" {
     try std.testing.expectEqual(xet.hash.verification(&.{chunks[0].hash}), try file.verification(0));
 }
 
+fn uploadRepeatedAbc(client: *xet.http.Client, allocator: std.mem.Allocator, comptime streaming: bool) !xet.store.PublishResult {
+    if (!streaming) return client.upload(allocator, "AAA", .{ .compression = .none });
+    var session = try client.uploadSession(allocator, .{ .compression = .none });
+    defer session.deinit();
+    var file = try session.beginFile();
+    defer file.deinit();
+    for ("AAA") |byte| try file.write(&.{byte});
+    const result = try file.finish();
+    try session.finish();
+    return result;
+}
+
+fn exerciseFreshClientDedup(comptime streaming: bool) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const chunks = [_]xet.xorb.Chunk{.{
+        .data = "AAA",
+        .hash = xet.hash.data("AAA"),
+    }};
+    var object = try xet.xorb.serialize(allocator, &chunks, .none);
+    defer object.deinit(allocator);
+    const global_shard = try makeGlobalDedupShard(allocator, &object, null);
+    defer allocator.free(global_shard);
+    const responses = [_]support.HttpResponse{
+        .{ .status = .not_found },
+        .{},
+        .{ .body = result_json },
+        .{ .body = global_shard },
+        .{ .body = result_json },
+    };
+    var server = try support.Loopback.init(allocator, io, &responses);
+    defer server.deinit();
+    try server.start();
+
+    var first = try xet.http.Client.init(allocator, io, server.origin, "");
+    defer first.deinit();
+    const first_result = try uploadRepeatedAbc(&first, allocator, streaming);
+    var second = try xet.http.Client.init(allocator, io, server.origin, "");
+    defer second.deinit();
+    const second_result = try uploadRepeatedAbc(&second, allocator, streaming);
+    try server.finish(5);
+
+    try std.testing.expectEqual(first_result, second_result);
+    try std.testing.expectEqualStrings("/v1/xorbs/default/" ++ xet.hash.toHex(object.hash), server.exchanges.items[1].target);
+    try std.testing.expectEqual(@as(usize, object.body_length), server.exchanges.items[1].body.len);
+    try std.testing.expectEqualStrings("/v1/chunks/default-merkledb/" ++ xet.hash.toHex(chunks[0].hash), server.exchanges.items[3].target);
+    try std.testing.expectEqual(@as(usize, 0), server.exchanges.items[3].body.len);
+    try std.testing.expectEqualStrings("/v2/shards", server.exchanges.items[2].target);
+    try std.testing.expectEqualStrings("/v2/shards", server.exchanges.items[4].target);
+    const first_bytes = server.exchanges.items[1].body.len + server.exchanges.items[2].body.len;
+    try std.testing.expectEqual(@as(u64, @intCast(first_bytes)), first.uploadedBytes());
+    try std.testing.expectEqual(@as(u64, @intCast(server.exchanges.items[4].body.len)), second.uploadedBytes());
+    var uploads: usize = 0;
+    for (server.exchanges.items) |exchange| {
+        if (std.mem.startsWith(u8, exchange.target, "/v1/xorbs/default/")) uploads += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), uploads);
+    const reader = try xet.shard.Reader.init(server.exchanges.items[4].body);
+    try std.testing.expectEqual(@as(usize, 0), reader.footer.xorb_count);
+    try std.testing.expect((try reader.findFile(second_result.file_hash)) != null);
+}
+
+test "fresh clients deduplicate repeated HTTP xorb uploads" {
+    try exerciseFreshClientDedup(false);
+}
+
+test "incremental uploads through fresh clients retain global dedup" {
+    try exerciseFreshClientDedup(true);
+}
+
 test "Client.upload reuses a contiguous run from one global lookup" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -960,6 +1030,227 @@ test "global dedup allocation failures clean up pending matches and chunks" {
     }
 }
 
+const ReuseAllocationFailure = enum { segment, verification };
+
+fn exerciseReuseAllocationFailure(comptime failure: ReuseAllocationFailure) !void {
+    var tracker = support.TrackingAllocator{ .backing = std.testing.allocator };
+    defer tracker.deinit();
+    var destination = support.MemoryStore{ .allocator = std.testing.allocator };
+    defer destination.deinit();
+    {
+        var publisher = try xet.StorePublisher.init(tracker.allocator(), destination.store(), .{});
+        defer publisher.deinit();
+        const a_hash = xet.hash.data("xorb A");
+        const b_hash = xet.hash.data("xorb B");
+        const a_nodes = [_]xet.Node{.{ .hash = xet.hash.data("A0"), .size = 3 }};
+        const b_nodes = [_]xet.Node{
+            .{ .hash = xet.hash.data("B0"), .size = 3 },
+            .{ .hash = xet.hash.data("B1"), .size = 3 },
+        };
+        try publisher.segments.ensureTotalCapacityPrecise(tracker.allocator(), 4);
+        try publisher.checks.ensureTotalCapacityPrecise(tracker.allocator(), 4);
+        try publisher.reuse(a_hash, 0, &a_nodes);
+        while (publisher.segments.items.len < publisher.segments.capacity) {
+            try publisher.reuse(a_hash, 0, &a_nodes);
+        }
+        try std.testing.expectEqual(publisher.segments.items.len, publisher.checks.items.len);
+        try std.testing.expectEqual(publisher.segments.capacity, publisher.checks.capacity);
+        if (failure == .verification) {
+            try publisher.segments.ensureTotalCapacityPrecise(
+                tracker.allocator(),
+                publisher.segments.items.len + 1,
+            );
+        }
+        const segment_count = publisher.segments.items.len;
+
+        tracker.fail_at = tracker.allocation_count;
+        try std.testing.expectError(error.OutOfMemory, publisher.reuse(b_hash, 1, b_nodes[1..]));
+        tracker.fail_at = null;
+        try publisher.reuse(b_hash, 1, b_nodes[1..]);
+
+        var plan = try publisher.finishPlan();
+        defer plan.deinit(tracker.allocator());
+        try std.testing.expectEqual(segment_count + 1, plan.file.segments.len);
+        try std.testing.expectEqual(plan.file.segments.len, plan.file.verification.len);
+        for (plan.file.segments[0..segment_count], plan.file.verification[0..segment_count]) |segment, check| {
+            try std.testing.expectEqual(a_hash, segment.xorb_hash);
+            try std.testing.expectEqual(@as(u32, 0), segment.chunk_index_start);
+            try std.testing.expectEqual(@as(u32, 1), segment.chunk_index_end);
+            try std.testing.expectEqual(@as(u32, 3), segment.unpacked_segment_bytes);
+            try std.testing.expectEqual(xet.hash.verificationNodes(&a_nodes), check);
+        }
+        const segment = plan.file.segments[segment_count];
+        try std.testing.expectEqual(b_hash, segment.xorb_hash);
+        try std.testing.expectEqual(@as(u32, 1), segment.chunk_index_start);
+        try std.testing.expectEqual(@as(u32, 2), segment.chunk_index_end);
+        try std.testing.expectEqual(@as(u32, 3), segment.unpacked_segment_bytes);
+        try std.testing.expectEqual(xet.hash.verificationNodes(b_nodes[1..]), plan.file.verification[segment_count]);
+        try std.testing.expectEqual(@as(u64, @intCast(segment_count + 1)) * 3, plan.size);
+        try std.testing.expectEqual(@as(u64, segment_count + 1), plan.xorb_count);
+        try std.testing.expectEqual(@as(usize, 0), plan.new_xorbs.len);
+    }
+    try std.testing.expectEqual(@as(usize, 0), tracker.duplicate_frees);
+    try std.testing.expectEqual(@as(usize, 0), tracker.invalid_frees);
+    try std.testing.expectEqual(@as(usize, 0), tracker.outstanding());
+}
+
+test "reuse segment reservation failure preserves the active Xorb" {
+    try exerciseReuseAllocationFailure(.segment);
+}
+
+test "reuse verification reservation failure preserves the active Xorb" {
+    try exerciseReuseAllocationFailure(.verification);
+}
+
+test "reuse preflights a fresh segment before flushing pending input" {
+    var tracker = support.TrackingAllocator{ .backing = std.testing.allocator };
+    defer tracker.deinit();
+    var destination = support.MemoryStore{ .allocator = std.testing.allocator };
+    defer destination.deinit();
+    {
+        var publisher = try xet.StorePublisher.init(tracker.allocator(), destination.store(), .{});
+        defer publisher.deinit();
+        const object_hash = xet.hash.data("existing xorb");
+        const node = xet.Node{ .hash = xet.hash.data("AAA"), .size = 3 };
+        try publisher.segments.ensureTotalCapacityPrecise(tracker.allocator(), 1);
+        try publisher.checks.ensureTotalCapacityPrecise(tracker.allocator(), 1);
+        try publisher.reuse(object_hash, 0, &.{node});
+        try publisher.write("BBB");
+
+        tracker.fail_at = tracker.allocation_count;
+        try std.testing.expectError(error.OutOfMemory, publisher.reuse(object_hash, 1, &.{node}));
+        tracker.fail_at = null;
+        try publisher.reuse(object_hash, 1, &.{node});
+
+        var plan = try publisher.finishPlan();
+        defer plan.deinit(tracker.allocator());
+        try std.testing.expectEqual(@as(usize, 3), plan.file.segments.len);
+        try std.testing.expectEqual(object_hash, plan.file.segments[0].xorb_hash);
+        try std.testing.expectEqual(@as(u32, 0), plan.file.segments[0].chunk_index_start);
+        try std.testing.expectEqual(@as(u32, 1), plan.file.segments[0].chunk_index_end);
+        try std.testing.expectEqual(object_hash, plan.file.segments[2].xorb_hash);
+        try std.testing.expectEqual(@as(u32, 1), plan.file.segments[2].chunk_index_start);
+        try std.testing.expectEqual(@as(u32, 2), plan.file.segments[2].chunk_index_end);
+        try std.testing.expectEqual(xet.hash.verificationNodes(&.{node}), plan.file.verification[0]);
+        try std.testing.expectEqual(xet.hash.verificationNodes(&.{node}), plan.file.verification[2]);
+    }
+    try std.testing.expectEqual(@as(usize, 0), tracker.duplicate_frees);
+    try std.testing.expectEqual(@as(usize, 0), tracker.invalid_frees);
+    try std.testing.expectEqual(@as(usize, 0), tracker.outstanding());
+}
+
+test "low-level publisher write failure is terminal" {
+    var tracker = support.TrackingAllocator{ .backing = std.testing.allocator };
+    defer tracker.deinit();
+    var destination = support.MemoryStore{ .allocator = std.testing.allocator };
+    defer destination.deinit();
+    {
+        var publisher = try xet.StorePublisher.init(tracker.allocator(), destination.store(), .{});
+        defer publisher.deinit();
+        tracker.fail_at = tracker.allocation_count;
+        try std.testing.expectError(error.OutOfMemory, publisher.write("AAA"));
+        tracker.fail_at = null;
+        try std.testing.expectError(error.WriteFailed, publisher.write("AAA"));
+        const node = xet.Node{ .hash = xet.hash.data("AAA"), .size = 3 };
+        try std.testing.expectError(error.WriteFailed, publisher.reuse(xet.hash.data("existing"), 0, &.{node}));
+        try std.testing.expectError(error.WriteFailed, publisher.finishPlan());
+        try std.testing.expectError(error.WriteFailed, publisher.finish());
+        try std.testing.expectEqual(@as(usize, 0), destination.puts);
+    }
+    try std.testing.expectEqual(@as(usize, 0), tracker.duplicate_frees);
+    try std.testing.expectEqual(@as(usize, 0), tracker.invalid_frees);
+    try std.testing.expectEqual(@as(usize, 0), tracker.outstanding());
+}
+
+fn addSessionXorb(
+    session: *xet.DedupSessionIndex,
+    name: []const u8,
+    chunks: []const xet.shard.Chunk,
+) !void {
+    try session.addXorb(.{
+        .hash = xet.hash.data(name),
+        .chunks = chunks,
+        .raw_size = 1,
+        .serialized_size = 1,
+    });
+}
+
+fn expectSessionChunk(
+    session: *xet.DedupSessionIndex,
+    chunk_hash: xet.Hash,
+    xorb_name: []const u8,
+    size: u32,
+) !void {
+    var match = (try session.source().query(std.testing.allocator, &.{chunk_hash})).?;
+    defer match.deinit(std.testing.allocator);
+    try std.testing.expectEqual(xet.hash.data(xorb_name), match.xorb_hash);
+    try std.testing.expectEqual(@as(usize, 1), match.nodes.len);
+    try std.testing.expectEqual(size, match.nodes[0].size);
+}
+
+test "ordinary session insertions roll back completely" {
+    const allocator = std.testing.allocator;
+    var session = xet.DedupSessionIndex.init(allocator);
+    defer session.deinit();
+    const shared = xet.hash.data("shared");
+    const stable = xet.hash.data("stable");
+    const added = xet.hash.data("added");
+    try addSessionXorb(&session, "old", &.{
+        .{ .hash = shared, .byte_range_start = 0, .unpacked_segment_bytes = 1 },
+        .{ .hash = stable, .byte_range_start = 1, .unpacked_segment_bytes = 2 },
+    });
+    var point: ?xet.DedupSessionIndex.Checkpoint = session.checkpoint();
+    try addSessionXorb(&session, "new", &.{
+        .{ .hash = shared, .byte_range_start = 0, .unpacked_segment_bytes = 3 },
+        .{ .hash = added, .byte_range_start = 1, .unpacked_segment_bytes = 4 },
+    });
+    try addSessionXorb(&session, "newest", &.{
+        .{ .hash = shared, .byte_range_start = 0, .unpacked_segment_bytes = 5 },
+        .{ .hash = added, .byte_range_start = 1, .unpacked_segment_bytes = 6 },
+    });
+    try expectSessionChunk(&session, shared, "newest", 5);
+    try expectSessionChunk(&session, added, "newest", 6);
+
+    session.rollback(&point);
+    try std.testing.expect(point == null);
+    try std.testing.expectEqual(@as(usize, 1), session.xorbs.items.len);
+    try expectSessionChunk(&session, shared, "old", 1);
+    try expectSessionChunk(&session, stable, "old", 2);
+    try std.testing.expect((try session.source().query(allocator, &.{added})) == null);
+}
+
+test "session rollback after insertion allocation failure restores prior mappings" {
+    var tracker = support.TrackingAllocator{ .backing = std.testing.allocator };
+    defer tracker.deinit();
+    const allocator = tracker.allocator();
+    {
+        var session = xet.DedupSessionIndex.init(allocator);
+        defer session.deinit();
+        const shared = xet.hash.data("shared");
+        const added = xet.hash.data("added");
+        try addSessionXorb(&session, "old", &.{
+            .{ .hash = shared, .byte_range_start = 0, .unpacked_segment_bytes = 1 },
+        });
+        var point: ?xet.DedupSessionIndex.Checkpoint = session.checkpoint();
+        try addSessionXorb(&session, "new", &.{
+            .{ .hash = shared, .byte_range_start = 0, .unpacked_segment_bytes = 2 },
+            .{ .hash = added, .byte_range_start = 1, .unpacked_segment_bytes = 3 },
+        });
+        tracker.fail_at = tracker.allocation_count;
+        try std.testing.expectError(error.OutOfMemory, addSessionXorb(&session, "failed", &.{
+            .{ .hash = shared, .byte_range_start = 0, .unpacked_segment_bytes = 4 },
+        }));
+        tracker.fail_at = null;
+
+        session.rollback(&point);
+        try expectSessionChunk(&session, shared, "old", 1);
+        try std.testing.expect((try session.source().query(allocator, &.{added})) == null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), tracker.duplicate_frees);
+    try std.testing.expectEqual(@as(usize, 0), tracker.invalid_frees);
+    try std.testing.expectEqual(@as(usize, 0), tracker.outstanding());
+}
+
 test "low-level reuse publishes an owned UploadPlan" {
     const allocator = std.testing.allocator;
     const nodes = [_]xet.Node{
@@ -1139,17 +1430,155 @@ test "continued reuse rejects segment byte overflow without mutation" {
     try std.testing.expectEqual(@as(u64, node_count) * chunk_size, plan.size);
 }
 
-fn freeTestShardFile(allocator: std.mem.Allocator, file: xet.shard.File) void {
-    allocator.free(file.segments);
-    if (file.verification.len != 0) allocator.free(file.verification);
+test "reuse rejects file size overflow without mutation" {
+    const allocator = std.testing.allocator;
+    var destination = support.MemoryStore{ .allocator = allocator };
+    defer destination.deinit();
+    var publisher = try xet.StorePublisher.init(allocator, destination.store(), .{ .compression = .none });
+    defer publisher.deinit();
+    const object_hash = xet.hash.data("existing xorb");
+    const node = xet.Node{ .hash = xet.hash.data("AAA"), .size = 3 };
+    try publisher.reuse(object_hash, 0, &.{node});
+    publisher.size = std.math.maxInt(u64) - 2;
+    const before = publisher.segments.items[0];
+
+    try std.testing.expectError(error.FileTooLarge, publisher.reuse(object_hash, 1, &.{node}));
+    try std.testing.expectEqual(std.math.maxInt(u64) - 2, publisher.size);
+    try std.testing.expectEqual(@as(u64, 1), publisher.xorb_count);
+    try std.testing.expectEqual(@as(usize, 1), publisher.segments.items.len);
+    try std.testing.expectEqual(before, publisher.segments.items[0]);
 }
 
-fn decodeTestShardFile(allocator: std.mem.Allocator, info: xet.shard.FileInfo) !xet.shard.File {
-    var decoded = try info.decode(allocator);
-    const file = decoded.value;
-    decoded.value.segments = &.{};
-    decoded.value.verification = &.{};
-    return file;
+fn checkReusePendingOverflow(publisher: *xet.StorePublisher, destination: *const support.MemoryStore) !void {
+    publisher.size = std.math.maxInt(u64) - 4;
+    const size_before = publisher.size;
+    const xorb_count_before = publisher.xorb_count;
+    const puts_before = destination.puts;
+    const segment_count_before = publisher.segments.items.len;
+    const pending_len_before = publisher.pending_len;
+    const pending_head_before = publisher.pending_head;
+    const returned_before = publisher.chunker.returned_pending;
+    const buffered_before = try std.testing.allocator.dupe(u8, publisher.chunker.pending.items);
+    defer std.testing.allocator.free(buffered_before);
+    const queued_before = try std.testing.allocator.alloc([]u8, pending_len_before);
+    var initialized: usize = 0;
+    defer {
+        for (queued_before[0..initialized]) |bytes| std.testing.allocator.free(bytes);
+        std.testing.allocator.free(queued_before);
+    }
+    for (queued_before, 0..) |*copy, index| {
+        const chunk = publisher.pending_chunks[(pending_head_before + index) % xet.dedup_window];
+        copy.* = try std.testing.allocator.dupe(u8, chunk.data);
+        initialized += 1;
+    }
+    const node = xet.Node{ .hash = xet.hash.data("abc"), .size = 3 };
+
+    try std.testing.expectError(error.FileTooLarge, publisher.reuse(
+        xet.hash.data("existing xorb"),
+        0,
+        &.{node},
+    ));
+    try std.testing.expectEqual(size_before, publisher.size);
+    try std.testing.expectEqual(xorb_count_before, publisher.xorb_count);
+    try std.testing.expectEqual(puts_before, destination.puts);
+    try std.testing.expectEqual(segment_count_before, publisher.segments.items.len);
+    try std.testing.expectEqual(pending_len_before, publisher.pending_len);
+    try std.testing.expectEqual(pending_head_before, publisher.pending_head);
+    try std.testing.expectEqual(returned_before, publisher.chunker.returned_pending);
+    try std.testing.expectEqualSlices(u8, buffered_before, publisher.chunker.pending.items);
+    try std.testing.expect(publisher.has_complete_sha256);
+    for (queued_before, 0..) |expected, index| {
+        const chunk = publisher.pending_chunks[(pending_head_before + index) % xet.dedup_window];
+        try std.testing.expectEqualSlices(u8, expected, chunk.data);
+    }
+}
+
+test "reuse preflight preserves a short buffered tail" {
+    const allocator = std.testing.allocator;
+    var destination = support.MemoryStore{ .allocator = allocator };
+    defer destination.deinit();
+    var publisher = try xet.StorePublisher.init(allocator, destination.store(), .{
+        .compression = .none,
+        .max_xorb_size = 3,
+    });
+    defer publisher.deinit();
+    try publisher.write("abc");
+    try std.testing.expectEqualStrings("abc", publisher.chunker.pending.items);
+    try checkReusePendingOverflow(&publisher, &destination);
+}
+
+test "reuse preflight excludes an already counted returned chunk view" {
+    const allocator = std.testing.allocator;
+    var destination = support.MemoryStore{ .allocator = allocator };
+    defer destination.deinit();
+    var publisher = try xet.StorePublisher.init(allocator, destination.store(), .{
+        .compression = .none,
+        .max_xorb_size = 256 * 1024,
+    });
+    defer publisher.deinit();
+    const block = @as([128 * 1024]u8, @splat('x'));
+    try publisher.write(block[0 .. block.len - 1]);
+    try publisher.write(block[block.len - 1 ..]);
+    try std.testing.expect(publisher.chunker.returned_pending);
+    try std.testing.expectEqual(block.len, publisher.chunker.pending.items.len);
+    try std.testing.expectEqual(@as(u64, block.len), publisher.size);
+    publisher.size = std.math.maxInt(u64) - 4;
+    const node = xet.Node{ .hash = xet.hash.data("abc"), .size = 3 };
+    try publisher.reuse(xet.hash.data("existing xorb"), 0, &.{node});
+    try std.testing.expectEqual(std.math.maxInt(u64) - 1, publisher.size);
+    try std.testing.expect(!publisher.has_complete_sha256);
+    try std.testing.expect(!publisher.chunker.returned_pending);
+    try std.testing.expectEqual(@as(usize, 0), publisher.chunker.pending.items.len);
+    var plan = try publisher.finishPlan();
+    defer plan.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), plan.file.segments.len);
+    try std.testing.expectEqual(@as(u32, block.len), plan.file.segments[0].unpacked_segment_bytes);
+    try std.testing.expectEqual(@as(u32, 3), plan.file.segments[1].unpacked_segment_bytes);
+}
+
+test "reuse preflight preserves pending dedup chunks" {
+    const allocator = std.testing.allocator;
+    var destination = support.MemoryStore{ .allocator = allocator };
+    defer destination.deinit();
+    const Context = struct {
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const xet.Hash) !?xet.DedupMatch {
+            return null;
+        }
+    };
+    var dummy: u8 = 0;
+    var publisher = try xet.StorePublisher.init(allocator, destination.store(), .{
+        .compression = .none,
+        .max_xorb_size = 3,
+        .dedup_source = .{ .context = &dummy, .query_fn = Context.query },
+    });
+    defer publisher.deinit();
+    const block = @as([128 * 1024]u8, @splat('x'));
+    try publisher.write(&block);
+    try std.testing.expectEqual(@as(usize, 1), publisher.pending_len);
+    try std.testing.expectEqualSlices(u8, &block, publisher.pending_chunks[publisher.pending_head].data);
+    try checkReusePendingOverflow(&publisher, &destination);
+}
+
+test "adjacent reuse ranges continue from a nonzero chunk offset" {
+    const allocator = std.testing.allocator;
+    var destination = support.MemoryStore{ .allocator = allocator };
+    defer destination.deinit();
+    var publisher = try xet.StorePublisher.init(allocator, destination.store(), .{ .compression = .none });
+    defer publisher.deinit();
+    const object_hash = xet.hash.data("existing xorb");
+    const nodes = [_]xet.Node{
+        .{ .hash = xet.hash.data("CCC"), .size = 3 },
+        .{ .hash = xet.hash.data("BBB"), .size = 3 },
+    };
+    try publisher.reuse(object_hash, 2, nodes[0..1]);
+    try publisher.reuse(object_hash, 3, nodes[1..2]);
+    var plan = try publisher.finishPlan();
+    defer plan.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), plan.file.segments.len);
+    try std.testing.expectEqual(@as(u32, 2), plan.file.segments[0].chunk_index_start);
+    try std.testing.expectEqual(@as(u32, 4), plan.file.segments[0].chunk_index_end);
+    try std.testing.expectEqual(@as(u32, 6), plan.file.segments[0].unpacked_segment_bytes);
+    try std.testing.expectEqual(xet.hash.verificationNodes(&nodes), plan.file.verification[0]);
 }
 
 fn reconstructHttpShard(
@@ -1184,6 +1613,191 @@ fn reconstructHttpShard(
     });
     defer allocator.free(output);
     try std.testing.expectEqualSlices(u8, expected, output);
+}
+
+fn capturedHttpShard(exchanges: []const support.HttpExchange) ![]const u8 {
+    for (exchanges) |exchange| {
+        if (std.mem.endsWith(u8, exchange.target, "/shards")) return exchange.body;
+    }
+    return error.TestMissingPublishedShard;
+}
+
+fn reconstructCapturedHttp(
+    allocator: std.mem.Allocator,
+    exchanges: []const support.HttpExchange,
+    file_hash: xet.Hash,
+    expected: []const u8,
+) !void {
+    var manifest = try xet.reconstruction.planFromShard(
+        allocator,
+        try capturedHttpShard(exchanges),
+        file_hash,
+    );
+    defer manifest.deinit(allocator);
+    const Context = struct {
+        exchanges: []const support.HttpExchange,
+        reader: std.Io.Reader = undefined,
+        fn open(raw: *anyopaque, request: xet.reconstruction.Request) !*std.Io.Reader {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var target: ["/v1/xorbs/default/".len + 64]u8 = undefined;
+            const expected_target = try std.fmt.bufPrint(
+                &target,
+                "/v1/xorbs/default/{s}",
+                .{xet.hash.toHex(request.hash)},
+            );
+            for (self.exchanges) |exchange| {
+                if (std.mem.eql(u8, exchange.target, expected_target)) {
+                    self.reader = .fixed(exchange.body);
+                    return &self.reader;
+                }
+            }
+            return error.TestMissingCapturedXorb;
+        }
+        fn close(_: *anyopaque, _: *std.Io.Reader) void {}
+    };
+    var context = Context{ .exchanges = exchanges };
+    const output = try xet.reconstruction.reconstruct(allocator, &manifest.plan, .{
+        .context = &context,
+        .open_fn = Context.open,
+        .close_fn = Context.close,
+    });
+    defer allocator.free(output);
+    try std.testing.expectEqualSlices(u8, expected, output);
+}
+
+fn captureUpload(
+    allocator: std.mem.Allocator,
+    data: []const u8,
+    streaming: bool,
+) !struct { result: xet.store.PublishResult, shard: []u8 } {
+    const responses = [_]support.HttpResponse{};
+    var server = try support.Loopback.init(allocator, std.testing.io, &responses);
+    defer server.deinit();
+    try server.startGlobalDedup(null);
+    var client = try xet.http.Client.init(allocator, std.testing.io, server.origin, "");
+    defer client.deinit();
+    var session = try client.uploadSession(allocator, .{ .compression = .none });
+    defer session.deinit();
+    if (streaming) {
+        var file = try session.beginFile();
+        defer file.deinit();
+        const splits = [_]usize{ 1, 3, 4093, 17, 65_535, 2 };
+        var offset: usize = 0;
+        var index: usize = 0;
+        while (offset < data.len) : (index += 1) {
+            const end = @min(offset + splits[index % splits.len], data.len);
+            try file.write(data[offset..end]);
+            offset = end;
+        }
+        _ = try file.finish();
+    } else {
+        try session.addFile(data);
+    }
+    try session.finish();
+    try server.finish(server.exchanges.items.len);
+    const published = session.results()[0];
+    for (server.exchanges.items) |exchange| {
+        if (std.mem.endsWith(u8, exchange.target, "/shards")) {
+            return .{ .result = published, .shard = try allocator.dupe(u8, exchange.body) };
+        }
+    }
+    return error.TestMissingPublishedShard;
+}
+
+test "UploadSession incremental writes match whole-buffer file and reconstruction metadata" {
+    const allocator = std.testing.allocator;
+    const data = try deterministicChunks(allocator);
+    defer allocator.free(data);
+    const whole = try captureUpload(allocator, data, false);
+    defer allocator.free(whole.shard);
+    const incremental = try captureUpload(allocator, data, true);
+    defer allocator.free(incremental.shard);
+
+    try std.testing.expectEqual(whole.result, incremental.result);
+    try std.testing.expectEqualSlices(u8, whole.shard, incremental.shard);
+    const reader = try xet.shard.Reader.init(incremental.shard);
+    const file = (try reader.findFile(incremental.result.file_hash)).?;
+    try std.testing.expectEqual(@as(u64, data.len), incremental.result.size);
+    try std.testing.expect(file.count > 0);
+    try std.testing.expect((try file.sha256()) != null);
+}
+
+test "multiple incremental files preserve result order and combined shard publication" {
+    const allocator = std.testing.allocator;
+    const responses = [_]support.HttpResponse{};
+    var server = try support.Loopback.init(allocator, std.testing.io, &responses);
+    defer server.deinit();
+    try server.startGlobalDedup(null);
+    var client = try xet.http.Client.init(allocator, std.testing.io, server.origin, "");
+    defer client.deinit();
+    var session = try client.uploadSession(allocator, .{ .compression = .none });
+    defer session.deinit();
+    const inputs = [_][]const u8{ "AAA", "BBB" };
+    var returned: [inputs.len]xet.store.PublishResult = undefined;
+    for (inputs, &returned) |input, *result| {
+        var file = try session.beginFile();
+        defer file.deinit();
+        for (input) |byte| try file.write(&.{byte});
+        result.* = try file.finish();
+    }
+    try session.finish();
+    try server.finish(server.exchanges.items.len);
+
+    try std.testing.expectEqual(inputs.len, session.results().len);
+    for (session.results(), returned, inputs) |result, direct, input| {
+        try std.testing.expectEqual(direct, result);
+        const expected_hash = try xet.hash.file(allocator, &.{.{
+            .hash = xet.hash.data(input),
+            .size = input.len,
+        }});
+        try std.testing.expectEqual(expected_hash, result.file_hash);
+        try std.testing.expectEqual(@as(u64, input.len), result.size);
+    }
+    var shard_count: usize = 0;
+    for (server.exchanges.items) |exchange| {
+        if (!std.mem.endsWith(u8, exchange.target, "/shards")) continue;
+        shard_count += 1;
+        const reader = try xet.shard.Reader.init(exchange.body);
+        try std.testing.expectEqual(@as(usize, 2), reader.footer.file_count);
+        try std.testing.expectEqual(@as(usize, 2), reader.footer.xorb_count);
+        for (session.results(), inputs) |result, input| {
+            const file = (try reader.findFile(result.file_hash)).?;
+            try std.testing.expectEqual(@as(u32, 1), file.count);
+            try std.testing.expectEqual(xet.hash.verification(&.{xet.hash.data(input)}), try file.verification(0));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), shard_count);
+}
+
+test "UploadSession file handles clean up unfinished and reject invalid lifecycle transitions" {
+    const allocator = std.testing.allocator;
+    const responses = [_]support.HttpResponse{};
+    var server = try support.Loopback.init(allocator, std.testing.io, &responses);
+    defer server.deinit();
+    try server.startGlobalDedup(null);
+    var client = try xet.http.Client.init(allocator, std.testing.io, server.origin, "");
+    defer client.deinit();
+    var session = try client.uploadSession(allocator, .{ .compression = .none });
+    defer session.deinit();
+
+    var unfinished = try session.beginFile();
+    try unfinished.write("discarded");
+    try std.testing.expectError(error.FileAlreadyActive, session.beginFile());
+    try std.testing.expectError(error.FileAlreadyActive, session.finish());
+    unfinished.deinit();
+
+    var file = try session.beginFile();
+    defer file.deinit();
+    try file.write("AAA");
+    const result = try file.finish();
+    try std.testing.expectError(error.AlreadyFinished, file.write("more"));
+    try std.testing.expectError(error.AlreadyFinished, file.finish());
+    try session.finish();
+    try server.finish(server.exchanges.items.len);
+    try std.testing.expectEqual(@as(usize, 1), session.results().len);
+    try std.testing.expectEqual(result, session.results()[0]);
+    try std.testing.expectError(error.AlreadyFinished, session.beginFile());
+    try std.testing.expectError(error.AlreadyFinished, session.finish());
 }
 
 test "UploadSession uploads only unmatched chunks and publishes one combined shard" {
@@ -1225,7 +1839,7 @@ test "UploadSession uploads only unmatched chunks and publishes one combined sha
 
     try std.testing.expectEqual(@as(usize, 2), session.results().len);
     const inputs = [_][]const u8{ "AAA", "BBB" };
-    const expected_objects = [_]*const xet.xorb.Serialized{ &global_object, &new_object };
+    const objects = [_]*const xet.xorb.Serialized{ &global_object, &new_object };
     const uploaded_shard = server.exchanges.items[3].body;
     const reader = try xet.shard.Reader.init(uploaded_shard);
     try std.testing.expectEqual(@as(usize, 2), reader.footer.file_count);
@@ -1234,7 +1848,7 @@ test "UploadSession uploads only unmatched chunks and publishes one combined sha
     const uploaded_info = (try reader.findXorb(new_object.hash)).?;
     try std.testing.expectEqual(@as(u32, 1), uploaded_info.count);
     try std.testing.expectEqual(xet.hash.data("BBB"), (try uploaded_info.chunk(0)).hash);
-    for (session.results(), inputs, expected_objects) |result, input, object| {
+    for (session.results(), inputs, objects) |result, input, object| {
         const info = (try reader.findFile(result.file_hash)).?;
         try std.testing.expectEqual(@as(u32, 1), info.count);
         const segment = try info.segment(0);
@@ -1258,17 +1872,167 @@ test "UploadSession uploads only unmatched chunks and publishes one combined sha
             .serialized_size = @intCast(new_object.body_length),
         },
     };
-    var decoded_files: [2]xet.shard.File = undefined;
-    for (session.results(), &decoded_files) |result, *file| {
-        file.* = try decodeTestShardFile(allocator, (try reader.findFile(result.file_hash)).?);
+    var files: [2]xet.shard.OwnedFile = undefined;
+    var count: usize = 0;
+    defer for (files[0..count]) |*file| file.deinit(allocator);
+    for (session.results(), &files) |result, *file| {
+        file.* = try (try reader.findFile(result.file_hash)).?.decode(allocator);
+        count += 1;
     }
-    defer for (&decoded_files) |file| freeTestShardFile(allocator, file);
-    const full_shard = try xet.shard.serialize(allocator, &decoded_files, &metadata);
+    const full_shard = try xet.shard.serialize(allocator, &.{
+        files[0].value,
+        files[1].value,
+    }, &metadata);
     defer allocator.free(full_shard);
     for (session.results(), inputs) |result, input| {
         _ = try xet.reconstruction.validateShardFile(allocator, full_shard, result.file_hash);
-        try reconstructHttpShard(allocator, full_shard, result.file_hash, input, &expected_objects);
+        try reconstructHttpShard(allocator, full_shard, result.file_hash, input, &objects);
     }
+}
+
+fn exerciseRetainedXorbAfterFailedFile(comptime fail_finish: bool) !void {
+    const allocator = std.testing.allocator;
+    const responses = [_]support.HttpResponse{};
+    var server = try support.Loopback.init(allocator, std.testing.io, &responses);
+    defer server.deinit();
+    try server.startGlobalDedup(null);
+    var client = try xet.http.Client.init(allocator, std.testing.io, server.origin, "");
+    defer client.deinit();
+    var tracker = support.TrackingAllocator{ .backing = allocator };
+    defer tracker.deinit();
+    var session = try client.uploadSession(tracker.allocator(), .{
+        .compression = .none,
+        .max_xorb_size = 128 * 1024,
+    });
+    defer session.deinit();
+    const block = @as([128 * 1024]u8, @splat(0));
+    var first = try session.beginFile();
+    var retain_first = true;
+    defer if (retain_first) first.deinit();
+    for (0..65) |_| try first.write(&block);
+    if (fail_finish) {
+        tracker.fail_at = tracker.allocation_count;
+        try std.testing.expectError(error.OutOfMemory, first.finish());
+        tracker.fail_at = null;
+    }
+    first.deinit();
+    retain_first = false;
+
+    var second = try session.beginFile();
+    defer second.deinit();
+    try second.write(&block);
+    const result = try second.finish();
+    try session.finish();
+    try server.finish(server.exchanges.items.len);
+    try std.testing.expectEqual(@as(usize, 1), session.results().len);
+    try std.testing.expectEqual(result, session.results()[0]);
+    const shard_bytes = try capturedHttpShard(server.exchanges.items);
+    const reader = try xet.shard.Reader.init(shard_bytes);
+    try std.testing.expectEqual(@as(u32, 1), reader.footer.file_count);
+    try std.testing.expectEqual(@as(u32, 1), reader.footer.xorb_count);
+    const segment = try (try reader.findFile(result.file_hash)).?.segment(0);
+    const info = (try reader.findXorb(segment.xorb_hash)).?;
+    try std.testing.expectEqual(@as(u32, 1), info.count);
+    try std.testing.expectEqual(@as(u32, block.len), (try info.chunk(0)).unpacked_segment_bytes);
+    try reconstructCapturedHttp(allocator, server.exchanges.items, result.file_hash, &block);
+    try std.testing.expectEqual(@as(usize, 0), tracker.invalid_frees);
+    try std.testing.expectEqual(@as(usize, 0), tracker.duplicate_frees);
+}
+
+test "UploadSession publishes Xorb metadata retained after an abandoned file" {
+    try exerciseRetainedXorbAfterFailedFile(false);
+}
+
+test "UploadSession rolls back Xorb metadata after a failed finish" {
+    try exerciseRetainedXorbAfterFailedFile(true);
+}
+
+test "UploadSession rejects failed writes and stale handles preserve the active file" {
+    const allocator = std.testing.allocator;
+    const responses = [_]support.HttpResponse{};
+    var server = try support.Loopback.init(allocator, std.testing.io, &responses);
+    defer server.deinit();
+    try server.startGlobalDedup(null);
+    var client = try xet.http.Client.init(allocator, std.testing.io, server.origin, "");
+    defer client.deinit();
+    var tracker = support.TrackingAllocator{ .backing = allocator };
+    defer tracker.deinit();
+    var session = try client.uploadSession(tracker.allocator(), .{ .compression = .none });
+    defer session.deinit();
+
+    var failed = try session.beginFile();
+    var retain_failed = true;
+    defer if (retain_failed) failed.deinit();
+    tracker.fail_at = tracker.allocation_count;
+    try std.testing.expectError(error.OutOfMemory, failed.write("AAA"));
+    tracker.fail_at = null;
+    try std.testing.expectError(error.WriteFailed, failed.write("AAA"));
+    try std.testing.expectError(error.WriteFailed, failed.finish());
+
+    var replacement = try session.beginFile();
+    defer replacement.deinit();
+    try replacement.write("BBB");
+    failed.deinit();
+    retain_failed = false;
+    try replacement.write("CCC");
+    const result = try replacement.finish();
+    try session.finish();
+    try server.finish(server.exchanges.items.len);
+
+    try std.testing.expectEqual(@as(usize, 1), session.results().len);
+    try std.testing.expectEqual(result, session.results()[0]);
+    const shard_bytes = try capturedHttpShard(server.exchanges.items);
+    const reader = try xet.shard.Reader.init(shard_bytes);
+    try std.testing.expectEqual(@as(u32, 1), reader.footer.file_count);
+    const info = (try reader.findFile(result.file_hash)).?;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("BBBCCC", &digest, .{});
+    try std.testing.expectEqual(xet.hash.fromStandard(digest), (try info.sha256()).?);
+    try reconstructCapturedHttp(allocator, server.exchanges.items, result.file_hash, "BBBCCC");
+    try std.testing.expectEqual(@as(usize, 0), tracker.invalid_frees);
+    try std.testing.expectEqual(@as(usize, 0), tracker.duplicate_frees);
+}
+
+test "UploadSession joins reordered reused ranges at their actual offsets" {
+    const allocator = std.testing.allocator;
+    const responses = [_]support.HttpResponse{};
+    var server = try support.Loopback.init(allocator, std.testing.io, &responses);
+    defer server.deinit();
+    try server.startGlobalDedup(null);
+    var client = try xet.http.Client.init(allocator, std.testing.io, server.origin, "");
+    defer client.deinit();
+    var session = try client.uploadSession(allocator, .{
+        .compression = .none,
+        .max_xorb_size = 3 * 128 * 1024,
+    });
+    defer session.deinit();
+    var data: [3 * 128 * 1024]u8 = undefined;
+    @memset(data[0 .. 128 * 1024], 'A');
+    @memset(data[128 * 1024 .. 2 * 128 * 1024], 'B');
+    @memset(data[2 * 128 * 1024 ..], 'C');
+    try session.addFile(&data);
+    var reordered: [2 * 128 * 1024]u8 = undefined;
+    @memcpy(reordered[0 .. 128 * 1024], data[2 * 128 * 1024 ..]);
+    @memcpy(reordered[128 * 1024 ..], data[128 * 1024 .. 2 * 128 * 1024]);
+    try session.addFile(&reordered);
+    try session.finish();
+    try server.finish(server.exchanges.items.len);
+
+    const shard_bytes = try capturedHttpShard(server.exchanges.items);
+    _ = try xet.reconstruction.validateShardFile(allocator, shard_bytes, session.results()[1].file_hash);
+    const reader = try xet.shard.Reader.init(shard_bytes);
+    const info = (try reader.findFile(session.results()[1].file_hash)).?;
+    try std.testing.expectEqual(@as(u32, 2), info.count);
+    const expected = [_]xet.reconstruction.Range{
+        .{ .start = 2, .end = 3 },
+        .{ .start = 1, .end = 2 },
+    };
+    for (expected, 0..) |range, index| {
+        const segment = try info.segment(@intCast(index));
+        try std.testing.expectEqual(range.start, segment.chunk_index_start);
+        try std.testing.expectEqual(range.end, segment.chunk_index_end);
+    }
+    try reconstructCapturedHttp(allocator, server.exchanges.items, session.results()[1].file_hash, &reordered);
 }
 
 fn exerciseRemoteMisses(status: std.http.Status, inputs: []const []const u8, expected_lookups: usize) !void {
@@ -1297,7 +2061,7 @@ fn exerciseRemoteMisses(status: std.http.Status, inputs: []const []const u8, exp
     try std.testing.expectEqual(expected_lookups, lookups);
 }
 
-fn exerciseUploadSessionAllocationFailure(fail_at: ?usize) !usize {
+fn exerciseSessionAllocFailure(fail_at: ?usize) !usize {
     const allocator = std.testing.allocator;
     const responses = [_]support.HttpResponse{};
     var server = try support.Loopback.init(allocator, std.testing.io, &responses);
@@ -1308,32 +2072,63 @@ fn exerciseUploadSessionAllocationFailure(fail_at: ?usize) !usize {
     var tracker = support.TrackingAllocator{ .backing = allocator, .fail_at = fail_at };
     defer tracker.deinit();
     const operation = tracker.allocator();
-    var expected_failure = false;
+    var failed = false;
     _ = blk: {
         var session = client.uploadSession(operation, .{ .compression = .none }) catch |err| {
             try std.testing.expectEqual(error.OutOfMemory, err);
-            expected_failure = true;
+            failed = true;
             break :blk;
         };
         defer session.deinit();
-        session.addFile("AAA") catch |err| {
+        var first_file = session.beginFile() catch |err| {
             try std.testing.expectEqual(error.OutOfMemory, err);
-            expected_failure = true;
+            failed = true;
             break :blk;
         };
-        session.addFile("BBB") catch |err| {
+        _ = {
+            defer first_file.deinit();
+            first_file.write("A") catch |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                failed = true;
+                break :blk;
+            };
+            first_file.write("AA") catch |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                failed = true;
+                break :blk;
+            };
+            _ = first_file.finish() catch |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                failed = true;
+                break :blk;
+            };
+        };
+        var second_file = session.beginFile() catch |err| {
             try std.testing.expectEqual(error.OutOfMemory, err);
-            expected_failure = true;
+            failed = true;
             break :blk;
+        };
+        _ = {
+            defer second_file.deinit();
+            for ("BBB") |byte| second_file.write(&.{byte}) catch |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                failed = true;
+                break :blk;
+            };
+            _ = second_file.finish() catch |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                failed = true;
+                break :blk;
+            };
         };
         session.finish() catch |err| {
             try std.testing.expectEqual(error.OutOfMemory, err);
-            expected_failure = true;
+            failed = true;
             break :blk;
         };
         try std.testing.expectEqual(@as(usize, 2), session.results().len);
     };
-    if (fail_at != null) try std.testing.expect(expected_failure);
+    if (fail_at != null) try std.testing.expect(failed);
     try std.testing.expectEqual(@as(usize, 0), tracker.outstanding());
     try std.testing.expectEqual(@as(usize, 0), tracker.duplicate_frees);
     try std.testing.expectEqual(@as(usize, 0), tracker.invalid_frees);
@@ -1341,8 +2136,10 @@ fn exerciseUploadSessionAllocationFailure(fail_at: ?usize) !usize {
 }
 
 test "UploadSession operation allocation failures are clean" {
-    const allocations = try exerciseUploadSessionAllocationFailure(null);
-    for (0..allocations) |fail_at| _ = try exerciseUploadSessionAllocationFailure(fail_at);
+    const allocations = try exerciseSessionAllocFailure(null);
+    for (0..allocations) |fail_at| {
+        _ = try exerciseSessionAllocFailure(fail_at);
+    }
 }
 
 test "UploadSession avoids repeat remote lookups and retries failed files" {
@@ -1379,6 +2176,30 @@ test "global lookup failure and expired shard fall back to normal upload" {
     try server.finish(6);
     try checkXorbBody(server.exchanges.items[1].body);
     try checkXorbBody(server.exchanges.items[4].body);
+}
+
+test "HTTP upload byte counts match transmitted xorb and shard bodies" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const responses = [_]support.HttpResponse{
+        .{ .status = .not_found },
+        .{},
+        .{ .body = result_json },
+    };
+    var server = try support.Loopback.init(allocator, io, &responses);
+    defer server.deinit();
+    try server.start();
+    var client = try xet.http.Client.init(allocator, io, server.origin, "");
+    defer client.deinit();
+    try std.testing.expectEqual(@as(u64, 0), client.uploadedBytes());
+    const before = client.uploadedBytes();
+    _ = try client.upload(allocator, "AAA", .{ .compression = .none });
+    try server.finish(3);
+    var expected: u64 = 0;
+    for (server.exchanges.items) |exchange| {
+        if (!std.mem.startsWith(u8, exchange.target, "/v1/chunks/")) expected += exchange.body.len;
+    }
+    try std.testing.expectEqual(expected, client.uploadedBytes() - before);
 }
 
 test "simple HTTP download releases output after a hash mismatch" {
@@ -2233,4 +3054,7 @@ test "V2 shard upload falls back to V1 and caches the choice" {
     try std.testing.expectEqualStrings("/v2/shards", server.exchanges.items[0].target);
     try std.testing.expectEqualStrings("/v1/shards", server.exchanges.items[1].target);
     try std.testing.expectEqualStrings("/v1/shards", server.exchanges.items[2].target);
+    var expected: u64 = 0;
+    for (server.exchanges.items) |exchange| expected += exchange.body.len;
+    try std.testing.expectEqual(expected, client.uploadedBytes());
 }

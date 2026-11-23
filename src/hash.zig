@@ -186,25 +186,20 @@ pub const Aggregator = struct {
 
     pub fn root(self: *const Aggregator) !Hash {
         var work = self.*;
-        return work.rootMut();
-    }
-
-    fn rootMut(self: *Aggregator) !Hash {
-        if (self.leaves == 0) return zero;
-        if (self.leaves == 1) return self.levels[0].nodes[0].hash;
+        if (work.leaves == 0) return zero;
+        if (work.leaves == 1) return work.levels[0].nodes[0].hash;
         for (0..max_levels) |i| {
-            const level = &self.levels[i];
+            const level = &work.levels[i];
             if (level.len == 0) continue;
-            var higher = false;
-            for (self.levels[i + 1 ..]) |other| {
-                if (other.len != 0) higher = true;
-            }
+            const higher = for (work.levels[i + 1 ..]) |other| {
+                if (other.len != 0) break true;
+            } else false;
             if (level.len == 1 and !higher) return level.nodes[0].hash;
 
             var pos: usize = 0;
             while (pos < level.len) {
                 const cut = nextCut(level.nodes[pos..level.len]);
-                try self.addAt(i + 1, merge(level.nodes[pos..][0..cut]));
+                try work.addAt(i + 1, merge(level.nodes[pos..][0..cut]));
                 pos += cut;
             }
             level.len = 0;

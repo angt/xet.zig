@@ -35,7 +35,7 @@ pub const Plan = struct {
     locations: []Location,
     offset_into_first_range: u64 = 0,
     output_length: ?u64 = null,
-    /// Enables complete-file verification. Ranged output is unsupported
+    /// Complete-file verification is unavailable for ranged output
     file_hash: ?hashing.Hash = null,
 
     pub fn init(
@@ -238,7 +238,7 @@ pub const ShardPlan = struct {
     }
 };
 
-/// Validates file hashes and verification records. Null requires one file in the shard
+/// A null file hash requires exactly one file in the shard
 pub fn validateShardFile(
     allocator: std.mem.Allocator,
     bytes: []const u8,
@@ -254,7 +254,7 @@ pub fn validateShardFile(
     defer nodes.deinit(allocator);
     for (0..info.count) |index| {
         const segment = try info.segment(@intCast(index));
-        const object = try findShardXorb(reader, segment.xorb_hash);
+        const object = (try reader.findXorb(segment.xorb_hash)) orelse return error.NotFound;
         if (segment.chunk_index_start >= segment.chunk_index_end or
             segment.chunk_index_end > object.count) return error.InvalidRange;
         if (object.raw_size == 0) return error.InvalidShard;
@@ -314,7 +314,7 @@ pub fn planFromShard(
             .unpacked_length = segment.unpacked_segment_bytes,
             .range = .{ .start = segment.chunk_index_start, .end = segment.chunk_index_end },
         };
-        const object = try findShardXorb(reader, segment.xorb_hash);
+        const object = (try reader.findXorb(segment.xorb_hash)) orelse return error.NotFound;
         locations[index] = .{
             .hash = segment.xorb_hash,
             .range = .{ .start = 0, .end = object.count },
@@ -400,10 +400,6 @@ const ChunkVerifier = struct {
         }
     }
 };
-
-fn findShardXorb(reader: shard.Reader, hash: hashing.Hash) !shard.XorbInfo {
-    return (try reader.findXorb(hash)) orelse error.NotFound;
-}
 
 pub fn findLocation(locations: []const Location, term: Term) ?Location {
     for (locations) |location| {

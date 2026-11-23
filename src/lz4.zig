@@ -1,4 +1,4 @@
-//! LZ4 codec. Decodes linked blocks and encodes independent 64 KiB blocks
+//! LZ4 codec for linked decode blocks and independent 64 KiB encode blocks
 
 const std = @import("std");
 
@@ -74,7 +74,7 @@ pub const Scratch = struct {
     table: [1 << 13]u16 = undefined,
 };
 
-/// `dst` must have `input.len` bytes. Returns `null` unless compression shrinks
+/// `dst` must have `input.len` bytes; returns `null` unless compression shrinks
 fn encodeBlock(scratch: *Scratch, input: []const u8, dst: []u8) ?usize {
     std.debug.assert(input.len <= block_size);
     std.debug.assert(dst.len == input.len);
@@ -304,7 +304,7 @@ pub fn compressInto(
     output.appendSliceAssumeCapacity(&trailer);
 }
 
-/// Allocates scratch internally. Use `compressInto` to supply scratch
+/// Allocates compression scratch with `allocator`
 pub fn compress(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(allocator);

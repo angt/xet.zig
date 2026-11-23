@@ -31,6 +31,7 @@ pub const UploadPlan = @import("store.zig").Plan;
 pub const reconstruction = @import("reconstruction.zig");
 pub const http = @import("http.zig");
 pub const UploadSession = http.UploadSession;
+pub const UploadFile = http.UploadFile;
 
 test {
     const std = @import("std");
