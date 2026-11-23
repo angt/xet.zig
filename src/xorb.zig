@@ -247,7 +247,7 @@ pub const Serializer = struct {
     }
 };
 
-/// Writes a V1 footer. Inputs are borrowed only for this call
+/// Borrows chunks only for this call
 pub fn serialize(
     allocator: std.mem.Allocator,
     chunks: []const Chunk,
@@ -365,7 +365,6 @@ pub fn decodeRange(
     const bytes = try output.toOwnedSlice(allocator);
     errdefer allocator.free(bytes);
     const chunk_lengths = try lengths.toOwnedSlice(allocator);
-    errdefer allocator.free(chunk_lengths);
     return .{
         .bytes = bytes,
         .chunk_lengths = chunk_lengths,
@@ -458,9 +457,7 @@ pub fn verifyHash(allocator: std.mem.Allocator, input: []const u8, expected: has
 /// Verifies chunks, footer metadata, and object hash
 pub fn verify(allocator: std.mem.Allocator, input: []const u8) !void {
     const footer = try parseFooter(input);
-    const info_length = std.mem.readInt(u32, input[input.len - 4 ..][0..4], .little);
     const info = input[footer.body_length .. input.len - 4];
-    std.debug.assert(info.len == info_length);
     const hashes = info[52..][0 .. 32 * footer.chunk_count];
     const boundaries_start = 64 + 32 * footer.chunk_count;
     const packed_boundaries = info[boundaries_start..][0 .. 4 * footer.chunk_count];

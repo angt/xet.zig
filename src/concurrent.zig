@@ -191,7 +191,7 @@ pub fn consume(
         const task = tasks[current % options.window].?;
         while (!completed[current % options.window]) {
             const finished = (try select.await()).result.?;
-            // Await synchronizes task writes. Results may complete out of order
+            // Await synchronizes task writes while allowing out-of-order completion
             completed[finished.index % options.window] = true;
             if (finished.err) |err| return err;
         }

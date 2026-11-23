@@ -136,16 +136,12 @@ const FileLocation = struct { hash: hashing.Hash, index: u32 };
 const XorbLocation = struct { hash: hashing.Hash, index: u32 };
 const ChunkLocation = struct { hash: hashing.Hash, xorb_index: u32, chunk_index: u32 };
 
-fn hashLess(_: void, a: hashing.Hash, b: hashing.Hash) bool {
-    return hashing.order(a, b) == .lt;
-}
-
 fn fileLess(_: void, a: File, b: File) bool {
-    return hashLess({}, a.hash, b.hash);
+    return hashing.order(a.hash, b.hash) == .lt;
 }
 
 fn xorbLess(_: void, a: Xorb, b: Xorb) bool {
-    return hashLess({}, a.hash, b.hash);
+    return hashing.order(a.hash, b.hash) == .lt;
 }
 
 fn sameXorb(a: Xorb, b: Xorb) bool {
@@ -161,7 +157,7 @@ fn chunkLess(_: void, a: ChunkLocation, b: ChunkLocation) bool {
     return hashing.truncated(a.hash) < hashing.truncated(b.hash);
 }
 
-/// Serialize a deterministic, unkeyed shard. Inputs are sorted internally
+/// Sorts inputs internally to serialize a deterministic, unkeyed shard
 pub fn serialize(
     allocator: std.mem.Allocator,
     files_input: []const File,

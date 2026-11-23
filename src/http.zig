@@ -1,4 +1,4 @@
-//! Standard Xet CAS HTTP adapter. Repository authentication is out of scope
+//! Standard Xet CAS HTTP adapter without repository authentication
 
 const std = @import("std");
 const hashing = @import("hash.zig");
@@ -33,6 +33,8 @@ pub const Client = struct {
     /// 404/501 responses select V1 for later calls
     reconstruction_version: std.atomic.Value(u8) = .init(2),
     shard_version: std.atomic.Value(u8) = .init(2),
+    upload_bytes_mutex: std.Io.Mutex = .init,
+    upload_bytes: u64 = 0,
 
     /// Accepts a CAS origin or an endpoint ending in `/v1` or `/v2`
     pub fn init(
@@ -63,6 +65,13 @@ pub const Client = struct {
         self.* = undefined;
     }
 
+    /// Whole request bodies successfully flushed, including retries but excluding partial writes
+    pub fn uploadedBytes(self: *Client) u64 {
+        self.upload_bytes_mutex.lockUncancelable(self.http_client.io);
+        defer self.upload_bytes_mutex.unlock(self.http_client.io);
+        return self.upload_bytes;
+    }
+
     pub fn store(self: *Client) storage.Store {
         return .{ .context = self, .put_fn = putObject };
     }
@@ -83,7 +92,6 @@ pub const Client = struct {
             .options = options,
             .global = .{
                 .client = self,
-                .allocator = self.allocator,
                 .io = self.http_client.io,
                 .index = .init(allocator),
             },
@@ -104,7 +112,7 @@ pub const Client = struct {
         return session.results()[0];
     }
 
-    /// Downloads and verifies a file. The caller owns the returned bytes
+    /// Returns caller-owned bytes after downloading and verifying the file
     pub fn download(
         self: *Client,
         allocator: std.mem.Allocator,
@@ -213,6 +221,9 @@ pub const Client = struct {
             try req_body.writer.writeAll(bytes);
             try req_body.end();
             try req.connection.?.flush();
+            self.upload_bytes_mutex.lockUncancelable(self.http_client.io);
+            defer self.upload_bytes_mutex.unlock(self.http_client.io);
+            self.upload_bytes += bytes.len;
         } else {
             try req.sendBodiless();
         }
@@ -305,7 +316,72 @@ pub const Client = struct {
     }
 };
 
-/// Streams files immediately and publishes their metadata together
+pub const UploadFile = struct {
+    const State = enum { active, finished, failed };
+
+    session: *UploadSession,
+    publisher: storage.Publisher,
+    id: u64,
+    state: State = .active,
+
+    /// Discards an unfinished file and rolls back its session dedup additions
+    pub fn deinit(self: *UploadFile) void {
+        if (self.session.active_file_id == self.id) {
+            if (self.state == .active or self.state == .failed) self.session.global.rollback();
+            self.release();
+        }
+        self.publisher.deinit();
+        self.* = undefined;
+    }
+
+    /// Borrows input only for this call; a failed write makes the file terminal
+    pub fn write(self: *UploadFile, input: []const u8) !void {
+        switch (self.state) {
+            .active => {},
+            .finished => return error.AlreadyFinished,
+            .failed => return error.WriteFailed,
+        }
+        self.publisher.write(input) catch |err| {
+            self.state = .failed;
+            self.release();
+            self.session.global.rollback();
+            return err;
+        };
+    }
+
+    /// Adds the file plan to the batch; session.finish publishes the combined shard
+    pub fn finish(self: *UploadFile) !storage.PublishResult {
+        switch (self.state) {
+            .active => {},
+            .finished => return error.AlreadyFinished,
+            .failed => return error.WriteFailed,
+        }
+        self.state = .finished;
+        errdefer self.state = .failed;
+        self.release();
+        const session = self.session;
+        errdefer session.global.rollback();
+        var plan = try self.publisher.finishPlan();
+        errdefer plan.deinit(session.allocator);
+        const result = storage.PublishResult{
+            .file_hash = plan.file.hash,
+            .size = plan.size,
+            .xorb_count = plan.xorb_count,
+        };
+        try session.results_list.ensureUnusedCapacity(session.allocator, 1);
+        try session.batch.append(&plan);
+        session.global.commit();
+        session.results_list.appendAssumeCapacity(result);
+        return result;
+    }
+
+    fn release(self: *UploadFile) void {
+        if (self.session.active_file_id != self.id) return;
+        self.session.active_file_id = null;
+    }
+};
+
+/// Streams files and publishes their metadata together
 pub const UploadSession = struct {
     client: *Client,
     allocator: std.mem.Allocator,
@@ -314,6 +390,8 @@ pub const UploadSession = struct {
     batch: storage.BatchPublisher,
     results_list: std.ArrayList(storage.PublishResult) = .empty,
     published: []storage.PublishResult = &.{},
+    active_file_id: ?u64 = null,
+    next_file_id: u64 = 0,
     finished: bool = false,
 
     pub fn deinit(self: *UploadSession) void {
@@ -324,32 +402,35 @@ pub const UploadSession = struct {
         self.* = undefined;
     }
 
-    pub fn addFile(self: *UploadSession, input: []const u8) !void {
+    /// The file handle borrows this session until deinitialization
+    pub fn beginFile(self: *UploadSession) !UploadFile {
         if (self.finished) return error.AlreadyFinished;
+        if (self.active_file_id != null) return error.FileAlreadyActive;
+        const id = self.next_file_id;
+        self.next_file_id +%= 1;
         self.global.beginFile();
+        errdefer self.global.rollback();
         var options = storage.PublisherOptions.fromPackOptions(self.options);
         options.dedup_source = self.global.source();
         options.new_xorb_listener = .{
             .context = &self.global,
             .callback = GlobalDedup.addXorb,
         };
-        var publisher = try storage.Publisher.init(self.allocator, self.client.store(), options);
-        defer publisher.deinit();
-        try publisher.write(input);
-        var plan = try publisher.finishPlan();
-        errdefer plan.deinit(self.allocator);
-        const result = storage.PublishResult{
-            .file_hash = plan.file.hash,
-            .size = plan.size,
-            .xorb_count = plan.xorb_count,
-        };
-        try self.results_list.ensureUnusedCapacity(self.allocator, 1);
-        try self.batch.append(&plan);
-        self.results_list.appendAssumeCapacity(result);
+        const publisher = try storage.Publisher.init(self.allocator, self.client.store(), options);
+        self.active_file_id = id;
+        return .{ .session = self, .publisher = publisher, .id = id };
+    }
+
+    pub fn addFile(self: *UploadSession, input: []const u8) !void {
+        var file = try self.beginFile();
+        defer file.deinit();
+        try file.write(input);
+        _ = try file.finish();
     }
 
     pub fn finish(self: *UploadSession) !void {
         if (self.finished) return error.AlreadyFinished;
+        if (self.active_file_id != null) return error.FileAlreadyActive;
         self.finished = true;
         const owned = try self.results_list.toOwnedSlice(self.allocator);
         errdefer self.allocator.free(owned);
@@ -357,6 +438,7 @@ pub const UploadSession = struct {
         self.published = owned;
     }
 
+    /// Results remain owned by the session and follow file finalization order
     pub fn results(self: *const UploadSession) []const storage.PublishResult {
         return self.published;
     }
@@ -366,19 +448,31 @@ const GlobalDedup = struct {
     const max_missed_remote = 16 * 1024;
 
     client: *Client,
-    allocator: std.mem.Allocator,
     io: std.Io,
     index: dedup.SessionIndex,
     missed_remote: std.AutoHashMapUnmanaged(hashing.Hash, void) = .empty,
+    point: ?dedup.SessionIndex.Checkpoint = null,
     first_query: bool = true,
 
     fn deinit(self: *GlobalDedup) void {
+        self.rollback();
         self.missed_remote.deinit(self.index.allocator);
         self.index.deinit();
     }
 
     fn beginFile(self: *GlobalDedup) void {
+        std.debug.assert(self.point == null);
+        self.point = self.index.checkpoint();
         self.first_query = true;
+    }
+
+    fn commit(self: *GlobalDedup) void {
+        if (self.point) |*point| point.deinit(self.index.allocator);
+        self.point = null;
+    }
+
+    fn rollback(self: *GlobalDedup) void {
+        self.index.rollback(&self.point);
     }
 
     fn source(self: *GlobalDedup) storage.DedupSource {
@@ -387,7 +481,7 @@ const GlobalDedup = struct {
 
     fn addXorb(raw: *anyopaque, item: shard.Xorb) !void {
         const self: *GlobalDedup = @ptrCast(@alignCast(raw));
-        try self.index.addXorb(item);
+        try self.index.addXorbTracked(item, if (self.point) |*point| point else null);
     }
 
     fn query(raw: *anyopaque, allocator: std.mem.Allocator, hashes: []const hashing.Hash) !?dedup.Match {
@@ -419,7 +513,7 @@ const GlobalDedup = struct {
         if (self.missed_remote.contains(hash)) return null;
         const hex = hashing.toHex(hash);
         const target = try self.client.url("/v1/chunks/default-merkledb/{s}", .{hex});
-        defer self.allocator.free(target);
+        defer self.client.allocator.free(target);
         var req = try self.client.request(.GET, target, null, true, null, true);
         defer req.deinit();
         var response = try req.receiveHead(&.{});
@@ -489,7 +583,6 @@ fn contentRange(response: *const std.http.Client.Response) !reconstruction.ByteR
         const start = std.fmt.parseUnsigned(u64, interval[0..dash], 10) catch return error.InvalidResponse;
         const end = std.fmt.parseUnsigned(u64, interval[dash + 1 ..], 10) catch return error.InvalidResponse;
         result = .{ .start = start, .end = end };
-        _ = try rangeLength(result.?);
     }
     return result orelse error.InvalidResponse;
 }
@@ -894,7 +987,6 @@ test "GlobalDedup caches remote misses but retries errors for the same hash" {
     defer client.deinit();
     var global = GlobalDedup{
         .client = &client,
-        .allocator = allocator,
         .io = std.testing.io,
         .index = .init(allocator),
     };
