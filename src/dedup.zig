@@ -17,7 +17,8 @@ pub const Match = struct {
 
     pub fn unpackedBytes(self: *const Match) !u32 {
         var total: u64 = 0;
-        for (self.nodes) |node| total += node.size;
+        for (self.nodes) |node| total = std.math.add(u64, total, node.size) catch
+            return error.InvalidDedupMatch;
         return std.math.cast(u32, total) orelse error.InvalidDedupMatch;
     }
 };
@@ -295,6 +296,23 @@ test "dedup source rejects invalid matches and releases their nodes" {
         error.InvalidDedupMatch,
         source.query(std.testing.allocator, &.{hashing.data("AAA")}),
     );
+}
+
+test "dedup source rejects overflowing node sizes and releases their nodes" {
+    const Context = struct {
+        fn query(_: *anyopaque, allocator: std.mem.Allocator, hashes: []const hashing.Hash) !?Match {
+            const nodes = try allocator.alloc(hashing.Node, 2);
+            nodes[0] = .{ .hash = hashes[0], .size = std.math.maxInt(u64) };
+            nodes[1] = .{ .hash = hashes[1], .size = 1 };
+            return .{ .nodes = nodes, .xorb_hash = hashing.zero, .chunk_index_start = 0 };
+        }
+    };
+    var dummy: u8 = 0;
+    const source = Source{ .context = &dummy, .query_fn = Context.query };
+    try std.testing.expectError(error.InvalidDedupMatch, source.query(
+        std.testing.allocator,
+        &.{ hashing.data("AAA"), hashing.data("BBB") },
+    ));
 }
 
 test "session lookup owns Xorb metadata and returns contiguous runs" {

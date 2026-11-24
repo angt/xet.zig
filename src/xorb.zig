@@ -313,10 +313,11 @@ pub fn decodeRange(
     end: u32,
 ) !Decoded {
     if (start >= end) return error.InvalidRange;
-    const body_length = if (parseFooter(input)) |footer| blk: {
-        if (end > footer.chunk_count) return error.InvalidRange;
-        break :blk footer.body_length;
-    } else |_| input.len;
+    const footer = parseFooter(input) catch null;
+    if (footer) |value| {
+        if (end > value.chunk_count) return error.InvalidRange;
+    }
+    const body_length = if (footer) |value| value.body_length else input.len;
 
     var lengths: std.ArrayList(u32) = .empty;
     errdefer lengths.deinit(allocator);
@@ -326,7 +327,7 @@ pub fn decodeRange(
     defer scratch.deinit(allocator);
     var position: usize = 0;
     var index: u32 = 0;
-    while (position < body_length and index < end) : (index += 1) {
+    while (position < body_length and (footer == null or index < end)) : (index += 1) {
         if (body_length - position < 8) return error.InvalidXorb;
         const header = input[position..][0..8];
         position += 8;
@@ -338,7 +339,7 @@ pub fn decodeRange(
             raw_size == 0 or raw_size > constants.max_chunk_size) return error.InvalidChunkSize;
         const payload = input[position..][0..compressed_size];
         position += compressed_size;
-        if (index < start) continue;
+        if (index < start or index >= end) continue;
         const compression = std.enums.fromInt(Compression, header[4]) orelse
             return error.UnsupportedCompression;
         switch (compression) {
@@ -361,7 +362,9 @@ pub fn decodeRange(
         }
         try lengths.append(allocator, @intCast(raw_size));
     }
-    if (index != end) return error.InvalidRange;
+    if (index < end) return error.InvalidRange;
+    if ((footer == null or end == footer.?.chunk_count) and position != body_length)
+        return error.InvalidXorb;
     const bytes = try output.toOwnedSlice(allocator);
     errdefer allocator.free(bytes);
     const chunk_lengths = try lengths.toOwnedSlice(allocator);
@@ -839,7 +842,7 @@ test "incremental decoding composes with fixed standard readers and writers" {
     try std.testing.expectEqualStrings("firstsecond", writer.buffered());
 }
 
-test "footerless raw xorb decodes the requested chunk range" {
+test "footerless raw xorb decodes prefixes suffixes and complete ranges" {
     const allocator = std.testing.allocator;
     const chunks = [_]Chunk{
         .{ .data = "zero", .hash = hashing.data("zero") },
@@ -848,9 +851,28 @@ test "footerless raw xorb decodes the requested chunk range" {
     var object = try serialize(allocator, &chunks, .none);
     defer object.deinit(allocator);
     const footer = try parseFooter(object.bytes);
-    var decoded = try decodeRange(allocator, object.bytes[0..footer.body_length], 0, 2);
-    defer decoded.deinit(allocator);
-    try std.testing.expectEqualStrings("zeroone", decoded.bytes);
+    const body = object.bytes[0..footer.body_length];
+    const cases = [_]struct { start: u32, end: u32, expected: []const u8 }{
+        .{ .start = 0, .end = 1, .expected = "zero" },
+        .{ .start = 1, .end = 2, .expected = "one" },
+        .{ .start = 0, .end = 2, .expected = "zeroone" },
+    };
+    for (cases) |case| {
+        var decoded = try decodeRange(allocator, body, case.start, case.end);
+        defer decoded.deinit(allocator);
+        try std.testing.expectEqualStrings(case.expected, decoded.bytes);
+        try std.testing.expectEqual(case.end - case.start, decoded.chunk_lengths.len);
+        for (decoded.chunk_lengths, chunks[case.start..case.end]) |actual, chunk|
+            try std.testing.expectEqual(@as(u32, @intCast(chunk.data.len)), actual);
+    }
+
+    const trailing = try allocator.alloc(u8, body.len + 1);
+    defer allocator.free(trailing);
+    @memcpy(trailing[0..body.len], body);
+    trailing[body.len] = 0;
+    try std.testing.expectError(error.InvalidXorb, decodeRange(allocator, trailing, 0, 1));
+    try std.testing.expectError(error.InvalidXorb, decodeRange(allocator, trailing, 1, 2));
+    try std.testing.expectError(error.InvalidXorb, decodeRange(allocator, trailing, 0, 2));
 }
 
 test "xorb decoding rejects an empty requested range" {

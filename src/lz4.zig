@@ -246,7 +246,7 @@ pub fn decompressInto(input: []const u8, output: []u8) Error!void {
         if (position > input.len or input.len - position < 4) return error.InvalidFrame;
         const expected = std.mem.readInt(u32, input[position..][0..4], .little);
         position += 4;
-        if (checksum(output) != expected) return error.ChecksumMismatch;
+        if (checksum(output[0..output_position]) != expected) return error.ChecksumMismatch;
     }
     if (position != input.len or output_position != output.len) return error.InvalidSize;
 }
@@ -390,6 +390,23 @@ test "every truncated frame is rejected without reading out of bounds" {
         0, 0, 0, 0, // End mark
     };
     try std.testing.expectError(error.InvalidFrame, decompress(allocator, &raw, 0));
+}
+
+test "LZ4 validates the content checksum only on decoded output" {
+    const allocator = std.testing.allocator;
+    const encoded = try compress(allocator, "a");
+    defer allocator.free(encoded);
+
+    // Drop the content-size field so the size mismatch is only caught after decoding
+    const frame = try allocator.alloc(u8, encoded.len - 8);
+    defer allocator.free(frame);
+    @memcpy(frame[0..6], encoded[0..6]);
+    frame[4] &= ~@as(u8, 0x08);
+    frame[6] = @truncate(checksum(frame[4..6]) >> 8);
+    @memcpy(frame[7..], encoded[15..]);
+
+    var output: [2]u8 = @splat(0xff);
+    try std.testing.expectError(error.InvalidSize, decompressInto(frame, &output));
 }
 
 test "LZ4 rejects corruption and wrong output size" {
