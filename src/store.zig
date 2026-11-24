@@ -725,19 +725,13 @@ pub const Publisher = struct {
     }
 };
 
-const regression_publisher_input = @as([128 * 1024]u8, @splat('x'));
+const test_publisher_input = @as([128 * 1024]u8, @splat('x'));
 
-fn regressionPublisherInput() ![]const u8 {
-    const chunks = try chunker.chunkBuffer(std.testing.allocator, &regression_publisher_input);
-    defer std.testing.allocator.free(chunks);
-    return chunks[0].data;
-}
-
-fn regressionPublisherFailure(
+fn testPublisherFailure(
     stage: enum { chunk, metadata, store },
     fail_at: ?usize,
 ) anyerror!struct { failed: bool, allocations: usize, store_allocations: ?usize } {
-    const support = @import("regression_support");
+    const support = @import("test_support");
     var tracker = support.TrackingAllocator{ .backing = std.testing.allocator, .fail_at = fail_at };
     defer tracker.deinit();
     var destination = support.MemoryStore{
@@ -746,7 +740,7 @@ fn regressionPublisherFailure(
     };
     defer destination.deinit();
     if (stage == .store) destination.fail_on_put = 0;
-    const input = try regressionPublisherInput();
+    const input = &test_publisher_input;
     var publisher = try Publisher.init(tracker.allocator(), destination.store(), .{ .compression = .none });
     var failed = false;
     switch (stage) {
@@ -800,22 +794,17 @@ fn regressionPublisherFailure(
     };
 }
 
-fn regressionPublisherMetadataFailureAfterStore(offset: usize) !void {
-    const baseline = try regressionPublisherFailure(.metadata, null);
+fn testPublisherMetadataFailureAfterStore(offset: usize) !void {
+    const baseline = try testPublisherFailure(.metadata, null);
     const store_allocations = baseline.store_allocations orelse return error.TestNeverReachedXorbStore;
     const fail_at = store_allocations + offset;
-    const result = try regressionPublisherFailure(.metadata, fail_at);
+    const result = try testPublisherFailure(.metadata, fail_at);
     try std.testing.expect(result.failed);
     try std.testing.expectEqual(fail_at, result.allocations);
 }
 
-fn regressionPublisherStoreSweep() !void {
-    const result = try regressionPublisherFailure(.store, null);
-    try std.testing.expect(result.failed);
-}
-
-fn regressionRingFailure(fail_at: ?usize) !usize {
-    const support = @import("regression_support");
+fn testRingFailure(fail_at: ?usize) !usize {
+    const support = @import("test_support");
     const Context = struct {
         fn query(_: *anyopaque, _: std.mem.Allocator, _: []const hashing.Hash) !?dedup.Match {
             return null;
@@ -861,8 +850,8 @@ fn regressionRingFailure(fail_at: ?usize) !usize {
     return tracker.allocation_count;
 }
 
-fn regressionBatchFailure(fail_at: ?usize) !usize {
-    const support = @import("regression_support");
+fn testBatchFailure(fail_at: ?usize) !usize {
+    const support = @import("test_support");
     var tracker = support.TrackingAllocator{ .backing = std.testing.allocator, .fail_at = fail_at };
     defer tracker.deinit();
     var destination = support.MemoryStore{ .allocator = std.testing.allocator };
@@ -910,84 +899,447 @@ fn regressionBatchFailure(fail_at: ?usize) !usize {
     return tracker.allocation_count;
 }
 
+test "BatchPublisher rejects appends after completion" {
+    const support = @import("test_support");
+    const allocator = std.testing.allocator;
+    var destination = support.MemoryStore{ .allocator = allocator };
+    defer destination.deinit();
+    var batch = BatchPublisher.init(allocator, destination.store());
+    defer batch.deinit();
+    try batch.finish();
+
+    const segments = try allocator.alloc(shard.Segment, 1);
+    segments[0] = .{
+        .xorb_hash = hashing.data("xorb"),
+        .unpacked_segment_bytes = 0,
+        .chunk_index_start = 0,
+        .chunk_index_end = 0,
+    };
+    var plan = Plan{
+        .file = .{
+            .hash = hashing.data("file"),
+            .segments = segments,
+        },
+        .new_xorbs = &.{},
+    };
+    defer plan.deinit(allocator);
+    try std.testing.expectError(error.AlreadyFinished, batch.append(&plan));
+    try std.testing.expectEqual(@as(usize, 1), plan.file.segments.len);
+    try std.testing.expectEqual(@as(usize, 0), destination.count(.shard));
+}
+
 test "BatchPublisher allocation failures preserve ownership and clean up" {
-    const allocations = try regressionBatchFailure(null);
-    for (0..allocations) |fail_at| _ = try regressionBatchFailure(fail_at);
+    const allocations = try testBatchFailure(null);
+    for (0..allocations) |fail_at| _ = try testBatchFailure(fail_at);
 }
 
 test "Publisher ring allocation failures are clean" {
-    const allocations = try regressionRingFailure(null);
-    for (0..allocations) |fail_at| _ = try regressionRingFailure(fail_at);
+    const allocations = try testRingFailure(null);
+    for (0..allocations) |fail_at| _ = try testRingFailure(fail_at);
 }
 
 test "Publisher streaming serialization allocation failures are clean" {
-    const baseline = try regressionPublisherFailure(.chunk, null);
+    const baseline = try testPublisherFailure(.chunk, null);
     try std.testing.expect(!baseline.failed);
     for (0..baseline.allocations) |fail_at| {
-        const result = try regressionPublisherFailure(.chunk, fail_at);
+        const result = try testPublisherFailure(.chunk, fail_at);
         try std.testing.expect(result.failed);
     }
 }
 
 test "Publisher metadata list append failure after xorb store is clean" {
-    try regressionPublisherMetadataFailureAfterStore(0);
+    try testPublisherMetadataFailureAfterStore(0);
 }
 
 test "Publisher xorb metadata append failure after xorb store is clean" {
-    try regressionPublisherMetadataFailureAfterStore(1);
+    try testPublisherMetadataFailureAfterStore(1);
 }
 
 test "Publisher deinit is clean after an immediate store failure" {
-    try regressionPublisherStoreSweep();
+    const result = try testPublisherFailure(.store, null);
+    try std.testing.expect(result.failed);
 }
 
-test "streaming publisher matches contiguous hashes with tiny xorbs" {
-    const allocator = std.testing.allocator;
-    const data = try allocator.alloc(u8, 400_000);
-    defer allocator.free(data);
-    for (data, 0..) |*byte, index| byte.* = @truncate(index *% 31 +% index / 97);
-    var package = try pack(allocator, data, .{ .max_xorb_size = 128 * 1024 });
-    defer package.deinit(allocator);
+const ReuseAllocationFailure = enum { segment, verification };
 
-    const Context = struct {
-        xorbs: usize = 0,
-        xorb_bytes: std.ArrayList([]u8) = .empty,
-        shard_bytes: std.ArrayList(u8) = .empty,
-        fn put(raw: *anyopaque, object: Object) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            switch (object.kind) {
-                .xorb => {
-                    self.xorbs += 1;
-                    try self.xorb_bytes.append(std.testing.allocator, try std.testing.allocator.dupe(u8, object.data));
-                },
-                .shard => try self.shard_bytes.appendSlice(std.testing.allocator, object.data),
-            }
+fn exerciseReuseAllocationFailure(comptime failure: ReuseAllocationFailure) !void {
+    const support = @import("test_support");
+    var tracker = support.TrackingAllocator{ .backing = std.testing.allocator };
+    defer tracker.deinit();
+    var destination = support.MemoryStore{ .allocator = std.testing.allocator };
+    defer destination.deinit();
+    {
+        var publisher = try Publisher.init(tracker.allocator(), destination.store(), .{});
+        defer publisher.deinit();
+        const a_hash = hashing.data("xorb A");
+        const b_hash = hashing.data("xorb B");
+        const a_nodes = [_]hashing.Node{.{ .hash = hashing.data("A0"), .size = 3 }};
+        const b_nodes = [_]hashing.Node{
+            .{ .hash = hashing.data("B0"), .size = 3 },
+            .{ .hash = hashing.data("B1"), .size = 3 },
+        };
+        try publisher.segments.ensureTotalCapacityPrecise(tracker.allocator(), 4);
+        try publisher.checks.ensureTotalCapacityPrecise(tracker.allocator(), 4);
+        try publisher.reuse(a_hash, 0, &a_nodes);
+        while (publisher.segments.items.len < publisher.segments.capacity) {
+            try publisher.reuse(a_hash, 0, &a_nodes);
         }
-    };
-    var context = Context{};
-    defer {
-        for (context.xorb_bytes.items) |bytes| allocator.free(bytes);
-        context.xorb_bytes.deinit(allocator);
-        context.shard_bytes.deinit(allocator);
+        try std.testing.expectEqual(publisher.segments.items.len, publisher.checks.items.len);
+        try std.testing.expectEqual(publisher.segments.capacity, publisher.checks.capacity);
+        if (failure == .verification) {
+            try publisher.segments.ensureTotalCapacityPrecise(
+                tracker.allocator(),
+                publisher.segments.items.len + 1,
+            );
+        }
+        const segment_count = publisher.segments.items.len;
+
+        tracker.fail_at = tracker.allocation_count;
+        try std.testing.expectError(error.OutOfMemory, publisher.reuse(b_hash, 1, b_nodes[1..]));
+        tracker.fail_at = null;
+        try publisher.reuse(b_hash, 1, b_nodes[1..]);
+
+        var plan = try publisher.finishPlan();
+        defer plan.deinit(tracker.allocator());
+        try std.testing.expectEqual(segment_count + 1, plan.file.segments.len);
+        try std.testing.expectEqual(plan.file.segments.len, plan.file.verification.len);
+        for (plan.file.segments[0..segment_count], plan.file.verification[0..segment_count]) |segment, check| {
+            try std.testing.expectEqual(a_hash, segment.xorb_hash);
+            try std.testing.expectEqual(@as(u32, 0), segment.chunk_index_start);
+            try std.testing.expectEqual(@as(u32, 1), segment.chunk_index_end);
+            try std.testing.expectEqual(@as(u32, 3), segment.unpacked_segment_bytes);
+            try std.testing.expectEqual(hashing.verificationNodes(&a_nodes), check);
+        }
+        const segment = plan.file.segments[segment_count];
+        try std.testing.expectEqual(b_hash, segment.xorb_hash);
+        try std.testing.expectEqual(@as(u32, 1), segment.chunk_index_start);
+        try std.testing.expectEqual(@as(u32, 2), segment.chunk_index_end);
+        try std.testing.expectEqual(@as(u32, 3), segment.unpacked_segment_bytes);
+        try std.testing.expectEqual(hashing.verificationNodes(b_nodes[1..]), plan.file.verification[segment_count]);
+        try std.testing.expectEqual(@as(u64, @intCast(segment_count + 1)) * 3, plan.size);
+        try std.testing.expectEqual(@as(u64, segment_count + 1), plan.xorb_count);
+        try std.testing.expectEqual(@as(usize, 0), plan.new_xorbs.len);
     }
-    var publisher = try Publisher.init(allocator, .{ .context = &context, .put_fn = Context.put }, .{
-        .max_xorb_size = 128 * 1024,
+    try std.testing.expectEqual(@as(usize, 0), tracker.duplicate_frees);
+    try std.testing.expectEqual(@as(usize, 0), tracker.invalid_frees);
+    try std.testing.expectEqual(@as(usize, 0), tracker.outstanding());
+}
+
+test "reuse segment reservation failure preserves the active Xorb" {
+    try exerciseReuseAllocationFailure(.segment);
+}
+
+test "reuse verification reservation failure preserves the active Xorb" {
+    try exerciseReuseAllocationFailure(.verification);
+}
+
+test "reuse preflights a fresh segment before flushing pending input" {
+    const support = @import("test_support");
+    var tracker = support.TrackingAllocator{ .backing = std.testing.allocator };
+    defer tracker.deinit();
+    var destination = support.MemoryStore{ .allocator = std.testing.allocator };
+    defer destination.deinit();
+    {
+        var publisher = try Publisher.init(tracker.allocator(), destination.store(), .{});
+        defer publisher.deinit();
+        const object_hash = hashing.data("existing xorb");
+        const node = hashing.Node{ .hash = hashing.data("AAA"), .size = 3 };
+        try publisher.segments.ensureTotalCapacityPrecise(tracker.allocator(), 1);
+        try publisher.checks.ensureTotalCapacityPrecise(tracker.allocator(), 1);
+        try publisher.reuse(object_hash, 0, &.{node});
+        try publisher.write("BBB");
+
+        tracker.fail_at = tracker.allocation_count;
+        try std.testing.expectError(error.OutOfMemory, publisher.reuse(object_hash, 1, &.{node}));
+        tracker.fail_at = null;
+        try publisher.reuse(object_hash, 1, &.{node});
+
+        var plan = try publisher.finishPlan();
+        defer plan.deinit(tracker.allocator());
+        try std.testing.expectEqual(@as(usize, 3), plan.file.segments.len);
+        try std.testing.expectEqual(object_hash, plan.file.segments[0].xorb_hash);
+        try std.testing.expectEqual(@as(u32, 0), plan.file.segments[0].chunk_index_start);
+        try std.testing.expectEqual(@as(u32, 1), plan.file.segments[0].chunk_index_end);
+        try std.testing.expectEqual(object_hash, plan.file.segments[2].xorb_hash);
+        try std.testing.expectEqual(@as(u32, 1), plan.file.segments[2].chunk_index_start);
+        try std.testing.expectEqual(@as(u32, 2), plan.file.segments[2].chunk_index_end);
+        try std.testing.expectEqual(hashing.verificationNodes(&.{node}), plan.file.verification[0]);
+        try std.testing.expectEqual(hashing.verificationNodes(&.{node}), plan.file.verification[2]);
+    }
+    try std.testing.expectEqual(@as(usize, 0), tracker.duplicate_frees);
+    try std.testing.expectEqual(@as(usize, 0), tracker.invalid_frees);
+    try std.testing.expectEqual(@as(usize, 0), tracker.outstanding());
+}
+
+test "continued reuse rejects segment byte overflow without mutation" {
+    const support = @import("test_support");
+    const allocator = std.testing.allocator;
+    var destination = support.MemoryStore{ .allocator = allocator };
+    defer destination.deinit();
+    var publisher = try Publisher.init(allocator, destination.store(), .{ .compression = .none });
+    defer publisher.deinit();
+    const object_hash = hashing.data("existing xorb");
+    const chunk_size = 128 * 1024;
+    const node_count = std.math.maxInt(u32) / chunk_size;
+    for (0..node_count) |index| {
+        const node = hashing.Node{
+            .hash = support.syntheticHash(7, index),
+            .size = chunk_size,
+        };
+        try publisher.reuse(object_hash, @intCast(index), &.{node});
+    }
+    const extra = hashing.Node{
+        .hash = support.syntheticHash(7, node_count),
+        .size = chunk_size,
+    };
+    try std.testing.expectError(
+        error.InvalidDedupMatch,
+        publisher.reuse(object_hash, node_count, &.{extra}),
+    );
+
+    var plan = try publisher.finishPlan();
+    defer plan.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), plan.file.segments.len);
+    try std.testing.expectEqual(node_count * chunk_size, plan.file.segments[0].unpacked_segment_bytes);
+    try std.testing.expectEqual(node_count, plan.file.segments[0].chunk_index_end);
+    try std.testing.expectEqual(@as(u64, node_count) * chunk_size, plan.size);
+}
+
+test "reuse rejects file size overflow without mutation" {
+    const support = @import("test_support");
+    const allocator = std.testing.allocator;
+    var destination = support.MemoryStore{ .allocator = allocator };
+    defer destination.deinit();
+    var publisher = try Publisher.init(allocator, destination.store(), .{ .compression = .none });
+    defer publisher.deinit();
+    const object_hash = hashing.data("existing xorb");
+    const node = hashing.Node{ .hash = hashing.data("AAA"), .size = 3 };
+    try publisher.reuse(object_hash, 0, &.{node});
+    publisher.size = std.math.maxInt(u64) - 2;
+    const before = publisher.segments.items[0];
+
+    try std.testing.expectError(error.FileTooLarge, publisher.reuse(object_hash, 1, &.{node}));
+    try std.testing.expectEqual(std.math.maxInt(u64) - 2, publisher.size);
+    try std.testing.expectEqual(@as(u64, 1), publisher.xorb_count);
+    try std.testing.expectEqual(@as(usize, 1), publisher.segments.items.len);
+    try std.testing.expectEqual(before, publisher.segments.items[0]);
+}
+
+fn checkReusePendingOverflow(publisher: *Publisher, destination: *const @import("test_support").MemoryStore) !void {
+    publisher.size = std.math.maxInt(u64) - 4;
+    const size_before = publisher.size;
+    const xorb_count_before = publisher.xorb_count;
+    const puts_before = destination.puts;
+    const segment_count_before = publisher.segments.items.len;
+    const pending_len_before = publisher.pending_len;
+    const pending_head_before = publisher.pending_head;
+    const returned_before = publisher.chunker.returned_pending;
+    const buffered_before = try std.testing.allocator.dupe(u8, publisher.chunker.pending.items);
+    defer std.testing.allocator.free(buffered_before);
+    const queued_before = try std.testing.allocator.alloc([]u8, pending_len_before);
+    var initialized: usize = 0;
+    defer {
+        for (queued_before[0..initialized]) |bytes| std.testing.allocator.free(bytes);
+        std.testing.allocator.free(queued_before);
+    }
+    for (queued_before, 0..) |*copy, index| {
+        const chunk = publisher.pending_chunks[(pending_head_before + index) % dedup_window];
+        copy.* = try std.testing.allocator.dupe(u8, chunk.data);
+        initialized += 1;
+    }
+    const node = hashing.Node{ .hash = hashing.data("abc"), .size = 3 };
+
+    try std.testing.expectError(error.FileTooLarge, publisher.reuse(
+        hashing.data("existing xorb"),
+        0,
+        &.{node},
+    ));
+    try std.testing.expectEqual(size_before, publisher.size);
+    try std.testing.expectEqual(xorb_count_before, publisher.xorb_count);
+    try std.testing.expectEqual(puts_before, destination.puts);
+    try std.testing.expectEqual(segment_count_before, publisher.segments.items.len);
+    try std.testing.expectEqual(pending_len_before, publisher.pending_len);
+    try std.testing.expectEqual(pending_head_before, publisher.pending_head);
+    try std.testing.expectEqual(returned_before, publisher.chunker.returned_pending);
+    try std.testing.expectEqualSlices(u8, buffered_before, publisher.chunker.pending.items);
+    try std.testing.expect(publisher.has_complete_sha256);
+    for (queued_before, 0..) |expected, index| {
+        const chunk = publisher.pending_chunks[(pending_head_before + index) % dedup_window];
+        try std.testing.expectEqualSlices(u8, expected, chunk.data);
+    }
+}
+
+test "reuse preflight preserves a short buffered tail" {
+    const support = @import("test_support");
+    const allocator = std.testing.allocator;
+    var destination = support.MemoryStore{ .allocator = allocator };
+    defer destination.deinit();
+    var publisher = try Publisher.init(allocator, destination.store(), .{
+        .compression = .none,
+        .max_xorb_size = 3,
     });
     defer publisher.deinit();
-    for (data) |byte| try publisher.write(&.{byte});
-    const result = try publisher.finish();
-    try std.testing.expectEqual(package.file_hash, result.file_hash);
-    try std.testing.expectEqual(package.objects.len, result.xorb_count);
-    try std.testing.expectEqualSlices(u8, package.shard_bytes, context.shard_bytes.items);
-    for (package.objects) |*object| {
-        for (context.xorb_bytes.items) |uploaded| {
-            if (std.mem.eql(u8, uploaded, object.bytes)) break;
-        } else return error.TestMissingCanonicalXorb;
+    try publisher.write("abc");
+    try std.testing.expectEqualStrings("abc", publisher.chunker.pending.items);
+    try checkReusePendingOverflow(&publisher, &destination);
+}
+
+test "reuse preflight excludes an already counted returned chunk view" {
+    const support = @import("test_support");
+    const allocator = std.testing.allocator;
+    var destination = support.MemoryStore{ .allocator = allocator };
+    defer destination.deinit();
+    var publisher = try Publisher.init(allocator, destination.store(), .{
+        .compression = .none,
+        .max_xorb_size = 256 * 1024,
+    });
+    defer publisher.deinit();
+    const block = @as([128 * 1024]u8, @splat('x'));
+    try publisher.write(block[0 .. block.len - 1]);
+    try publisher.write(block[block.len - 1 ..]);
+    try std.testing.expect(publisher.chunker.returned_pending);
+    try std.testing.expectEqual(block.len, publisher.chunker.pending.items.len);
+    try std.testing.expectEqual(@as(u64, block.len), publisher.size);
+    publisher.size = std.math.maxInt(u64) - 4;
+    const node = hashing.Node{ .hash = hashing.data("abc"), .size = 3 };
+    try publisher.reuse(hashing.data("existing xorb"), 0, &.{node});
+    try std.testing.expectEqual(std.math.maxInt(u64) - 1, publisher.size);
+    try std.testing.expect(!publisher.has_complete_sha256);
+    try std.testing.expect(!publisher.chunker.returned_pending);
+    try std.testing.expectEqual(@as(usize, 0), publisher.chunker.pending.items.len);
+    var plan = try publisher.finishPlan();
+    defer plan.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), plan.file.segments.len);
+    try std.testing.expectEqual(@as(u32, block.len), plan.file.segments[0].unpacked_segment_bytes);
+    try std.testing.expectEqual(@as(u32, 3), plan.file.segments[1].unpacked_segment_bytes);
+}
+
+test "reuse preflight preserves pending dedup chunks" {
+    const support = @import("test_support");
+    const allocator = std.testing.allocator;
+    var destination = support.MemoryStore{ .allocator = allocator };
+    defer destination.deinit();
+    const Context = struct {
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const hashing.Hash) !?dedup.Match {
+            return null;
+        }
+    };
+    var dummy: u8 = 0;
+    var publisher = try Publisher.init(allocator, destination.store(), .{
+        .compression = .none,
+        .max_xorb_size = 3,
+        .dedup_source = .{ .context = &dummy, .query_fn = Context.query },
+    });
+    defer publisher.deinit();
+    const block = @as([128 * 1024]u8, @splat('x'));
+    try publisher.write(&block);
+    try std.testing.expectEqual(@as(usize, 1), publisher.pending_len);
+    try std.testing.expectEqualSlices(u8, &block, publisher.pending_chunks[publisher.pending_head].data);
+    try checkReusePendingOverflow(&publisher, &destination);
+}
+
+test "Publisher write-time xorb flush failure has clean ownership" {
+    const support = @import("test_support");
+    var tracker = support.TrackingAllocator{ .backing = std.testing.allocator };
+    defer tracker.deinit();
+    var destination = support.MemoryStore{
+        .allocator = std.testing.allocator,
+        .fail_on_put = 0,
+    };
+    defer destination.deinit();
+    const one_chunk = blk: {
+        const input = @as([128 * 1024]u8, @splat('x'));
+        const chunks = try chunker.chunkBuffer(std.testing.allocator, &input);
+        defer std.testing.allocator.free(chunks);
+        try std.testing.expectEqual(@as(usize, 1), chunks.len);
+        break :blk chunks[0].data;
+    };
+    var publisher = try Publisher.init(tracker.allocator(), destination.store(), .{
+        .compression = .none,
+        .max_xorb_size = @intCast(one_chunk.len),
+    });
+    try std.testing.expectError(error.InjectedStoreFailure, publisher.write(one_chunk));
+    try std.testing.expectEqual(@as(usize, 1), destination.puts);
+    try std.testing.expectEqual(ObjectKind.xorb, destination.last_attempted_kind.?);
+    publisher.deinit();
+    try std.testing.expectEqual(@as(usize, 0), tracker.duplicate_frees);
+    try std.testing.expectEqual(@as(usize, 0), tracker.invalid_frees);
+    try std.testing.expectEqual(@as(usize, 0), tracker.outstanding());
+}
+
+test "Publisher rejects every operation after a failed write" {
+    const support = @import("test_support");
+    var tracker = support.TrackingAllocator{ .backing = std.testing.allocator };
+    defer tracker.deinit();
+    var destination = support.MemoryStore{ .allocator = std.testing.allocator };
+    defer destination.deinit();
+    {
+        var publisher = try Publisher.init(tracker.allocator(), destination.store(), .{});
+        defer publisher.deinit();
+        tracker.fail_at = tracker.allocation_count;
+        try std.testing.expectError(error.OutOfMemory, publisher.write("AAA"));
+        tracker.fail_at = null;
+        try std.testing.expectError(error.WriteFailed, publisher.write("AAA"));
+        const node = hashing.Node{ .hash = hashing.data("AAA"), .size = 3 };
+        try std.testing.expectError(error.WriteFailed, publisher.reuse(hashing.data("existing"), 0, &.{node}));
+        try std.testing.expectError(error.WriteFailed, publisher.finishPlan());
+        try std.testing.expectError(error.WriteFailed, publisher.finish());
+        try std.testing.expectEqual(@as(usize, 0), destination.puts);
     }
+    try std.testing.expectEqual(@as(usize, 0), tracker.duplicate_frees);
+    try std.testing.expectEqual(@as(usize, 0), tracker.invalid_frees);
+    try std.testing.expectEqual(@as(usize, 0), tracker.outstanding());
+}
+
+test "direct reuse flushes pending input before the reused segment" {
+    const support = @import("test_support");
+    const allocator = std.testing.allocator;
+    const nodes = [_]hashing.Node{.{ .hash = hashing.data("AAA"), .size = 3 }};
+    const file_hash = try hashing.file(allocator, &.{
+        .{ .hash = hashing.data("BBB"), .size = 3 },
+        nodes[0],
+    });
+    var destination = support.MemoryStore{ .allocator = allocator };
+    defer destination.deinit();
+    var publisher = try Publisher.init(allocator, destination.store(), .{ .compression = .none });
+    defer publisher.deinit();
+    try publisher.write("BBB");
+    try publisher.reuse(hashing.data("existing xorb"), 0, &nodes);
+    var plan = try publisher.finishPlan();
+    defer plan.deinit(allocator);
+    try std.testing.expectEqual(file_hash, plan.file.hash);
+    try std.testing.expectEqual(@as(usize, 2), plan.file.segments.len);
+    try std.testing.expectEqual(@as(u64, 6), plan.size);
+    try std.testing.expectEqual(@as(usize, 1), plan.new_xorbs.len);
+    try std.testing.expectEqual(hashing.data("BBB"), plan.new_xorbs[0].chunks[0].hash);
+    try std.testing.expectEqual(@as(u32, 3), plan.new_xorbs[0].chunks[0].unpacked_segment_bytes);
+}
+
+test "adjacent reuse ranges continue from a nonzero chunk offset" {
+    const support = @import("test_support");
+    const allocator = std.testing.allocator;
+    var destination = support.MemoryStore{ .allocator = allocator };
+    defer destination.deinit();
+    var publisher = try Publisher.init(allocator, destination.store(), .{ .compression = .none });
+    defer publisher.deinit();
+    const object_hash = hashing.data("existing xorb");
+    const nodes = [_]hashing.Node{
+        .{ .hash = hashing.data("CCC"), .size = 3 },
+        .{ .hash = hashing.data("BBB"), .size = 3 },
+    };
+    try publisher.reuse(object_hash, 2, nodes[0..1]);
+    try publisher.reuse(object_hash, 3, nodes[1..2]);
+    var plan = try publisher.finishPlan();
+    defer plan.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), plan.file.segments.len);
+    try std.testing.expectEqual(@as(u32, 2), plan.file.segments[0].chunk_index_start);
+    try std.testing.expectEqual(@as(u32, 4), plan.file.segments[0].chunk_index_end);
+    try std.testing.expectEqual(@as(u32, 6), plan.file.segments[0].unpacked_segment_bytes);
+    try std.testing.expectEqual(hashing.verificationNodes(&nodes), plan.file.verification[0]);
 }
 
 test "Publisher releases BG4 scratch after multiple successful xorbs" {
-    const support = @import("regression_support");
+    const support = @import("test_support");
     const allocator = std.testing.allocator;
     var tracker: support.TrackingAllocator = .{ .backing = allocator };
     defer tracker.deinit();
@@ -1024,7 +1376,7 @@ test "Publisher borrows chunk input only while compressing" {
     }}, .none);
     defer expected.deinit(allocator);
 
-    var destination = @import("regression_support").MemoryStore{ .allocator = allocator };
+    var destination = @import("test_support").MemoryStore{ .allocator = allocator };
     defer destination.deinit();
     var publisher = try Publisher.init(allocator, destination.store(), .{
         .compression = .none,
@@ -1045,54 +1397,8 @@ test "Publisher borrows chunk input only while compressing" {
     return error.TestMissingPublishedXorb;
 }
 
-test "repeated xorbs upload once and retain every file segment" {
-    const allocator = std.testing.allocator;
-    const data = try allocator.alloc(u8, 4 * 1024 * 1024);
-    defer allocator.free(data);
-    @memset(data, 0);
-
-    const Context = struct {
-        uploads: usize = 0,
-        shard_bytes: std.ArrayList(u8) = .empty,
-        fn put(raw: *anyopaque, object: Object) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            switch (object.kind) {
-                .xorb => self.uploads += 1,
-                .shard => try self.shard_bytes.appendSlice(std.testing.allocator, object.data),
-            }
-        }
-    };
-    var context = Context{};
-    defer context.shard_bytes.deinit(allocator);
-    var publisher = try Publisher.init(allocator, .{ .context = &context, .put_fn = Context.put }, .{
-        .max_xorb_size = 1024 * 1024,
-    });
-    defer publisher.deinit();
-    try publisher.write(data);
-    const result = try publisher.finish();
-    try std.testing.expectEqual(@as(usize, 1), context.uploads);
-    try std.testing.expectEqual(@as(u64, 4), result.xorb_count);
-
-    const reader = try shard.Reader.init(context.shard_bytes.items);
-    const info = (try reader.findFile(result.file_hash)).?;
-    try std.testing.expectEqual(@as(u32, 4), info.count);
-    try std.testing.expectEqual(@as(usize, 1), reader.footer.xorb_count);
-    for (0..info.count) |index| {
-        const segment = try info.segment(@intCast(index));
-        try std.testing.expectEqual(@as(u32, 1024 * 1024), segment.unpacked_segment_bytes);
-        try std.testing.expectEqual(@as(u32, 0), segment.chunk_index_start);
-        try std.testing.expectEqual(@as(u32, 8), segment.chunk_index_end);
-    }
-
-    var package = try pack(allocator, data, .{ .max_xorb_size = 1024 * 1024 });
-    defer package.deinit(allocator);
-    const packed_reader = try shard.Reader.init(package.shard_bytes);
-    try std.testing.expectEqual(@as(usize, 1), packed_reader.footer.xorb_count);
-    try std.testing.expectEqual(result.file_hash, package.file_hash);
-}
-
 test "oversized shard publication uses the package allocator" {
-    const support = @import("regression_support");
+    const support = @import("test_support");
     const files = [_]shard.File{
         .{ .hash = support.syntheticHash(0, 0), .segments = &.{} },
         .{ .hash = support.syntheticHash(0, 1), .segments = &.{} },
@@ -1111,46 +1417,12 @@ test "oversized shard publication uses the package allocator" {
 
     var tracker = support.TrackingAllocator{ .backing = std.testing.allocator };
     defer tracker.deinit();
-    const package = Package{
-        .file_hash = hashing.data("file"),
-        .size = 2,
-        .objects = &.{},
-        .shard_bytes = bytes,
-    };
     var destination = support.MemoryStore{ .allocator = std.testing.allocator };
     defer destination.deinit();
-    try publishShardLimited(tracker.allocator(), bytes, package.size, destination.store(), 240);
+    try publishShardLimited(tracker.allocator(), bytes, 2, destination.store(), 240);
     try std.testing.expect(tracker.allocation_count != 0);
     try std.testing.expectEqual(@as(usize, 3), destination.count(.shard));
     try std.testing.expectEqual(@as(usize, 0), tracker.duplicate_frees);
     try std.testing.expectEqual(@as(usize, 0), tracker.invalid_frees);
     try std.testing.expectEqual(@as(usize, 0), tracker.outstanding());
-}
-
-test "pack and publish a multi-object package" {
-    const allocator = std.testing.allocator;
-    const data = try allocator.alloc(u8, 2_000_000);
-    defer allocator.free(data);
-    for (data, 0..) |*byte, i| byte.* = @truncate(i *% 31 +% i / 97);
-    var package = try pack(allocator, data, .{ .max_xorb_size = 128 * 1024 });
-    defer package.deinit(allocator);
-    try std.testing.expect(package.objects.len >= 2);
-    const reader = try shard.Reader.init(package.shard_bytes);
-    const info = (try reader.findFile(package.file_hash)).?;
-    try std.testing.expectEqual(@as(u32, @intCast(package.objects.len)), info.count);
-    const Context = struct {
-        objects: usize = 0,
-        shards: usize = 0,
-        fn put(raw: *anyopaque, object: Object) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            switch (object.kind) {
-                .xorb => self.objects += 1,
-                .shard => self.shards += 1,
-            }
-        }
-    };
-    var context = Context{};
-    try publish(allocator, &package, .{ .context = &context, .put_fn = Context.put });
-    try std.testing.expectEqual(package.objects.len, context.objects);
-    try std.testing.expectEqual(@as(usize, 1), context.shards);
 }

@@ -17,38 +17,26 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "xet", .module = xet }},
     });
+    xet.addImport("test_support", support);
 
-    const test_step = b.step("test", "Run the test suite");
-
-    const core_module = b.createModule(.{
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const core_support = b.createModule(.{
-        .root_source_file = b.path("tests/support.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{.{ .name = "xet", .module = core_module }},
-    });
-    core_module.addImport("regression_support", core_support);
-    const core_tests = b.addTest(.{
+    const unit_tests = b.addTest(.{
         .filters = test_filters,
-        .root_module = core_module,
+        .root_module = xet,
     });
-    test_step.dependOn(&b.addRunArtifact(core_tests).step);
-
-    const regression_tests = b.addTest(.{
+    const integration_tests = b.addTest(.{
         .filters = test_filters,
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/regression.zig"),
+            .root_source_file = b.path("tests/root.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "xet", .module = xet },
-                .{ .name = "regression_support", .module = support },
+                .{ .name = "test_support", .module = support },
             },
         }),
     });
-    test_step.dependOn(&b.addRunArtifact(regression_tests).step);
+
+    const test_step = b.step("test", "Run the test suite");
+    test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+    test_step.dependOn(&b.addRunArtifact(integration_tests).step);
 }

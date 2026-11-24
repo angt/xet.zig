@@ -299,8 +299,11 @@ test "32 identical nodes match the Rust reference" {
     );
 }
 
-test "empty hashes and hash endianness" {
+test "empty file hash is zero" {
     try std.testing.expectEqual(zero, try file(std.testing.allocator, &.{}));
+}
+
+test "hash hex uses Xet word order" {
     const raw = [32]u8{
         22,  175, 58, 132, 4,   75,  131, 214, 190, 153, 138, 66,  226, 3,   153, 242,
         204, 86,  80, 234, 249, 153, 80,  99,  159, 80,  65,  138, 236, 231, 149, 78,

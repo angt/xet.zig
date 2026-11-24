@@ -850,8 +850,8 @@ const empty_plan_json =
     \\{"terms":[],"fetch_info":{}}
 ;
 
-fn checkRegressionEndpoints(allocator: std.mem.Allocator, io: std.Io, suffix: []const u8) !void {
-    const support = @import("regression_support");
+fn checkCasEndpoints(allocator: std.mem.Allocator, io: std.Io, suffix: []const u8) !void {
+    const support = @import("test_support");
     const responses = [_]support.HttpResponse{ .{}, .{ .status = .not_found }, .{}, .{ .status = .not_found }, .{ .body = empty_plan_json } };
     var server = try support.Loopback.init(allocator, io, &responses);
     defer server.deinit();
@@ -873,7 +873,8 @@ fn checkRegressionEndpoints(allocator: std.mem.Allocator, io: std.Io, suffix: []
     try client.putShard("shard");
     var plan = try client.getPlan(file_hash, null);
     plan.deinit(allocator);
-    try server.finish(5);
+    try server.finish();
+    try std.testing.expectEqual(@as(usize, 5), server.exchanges.items.len);
     try std.testing.expectEqualStrings(get_path, server.exchanges.items[4].target);
     try std.testing.expectEqualStrings(xorb_path, server.exchanges.items[0].target);
     try std.testing.expectEqualStrings("/v2/shards", server.exchanges.items[1].target);
@@ -884,7 +885,7 @@ fn checkRegressionEndpoints(allocator: std.mem.Allocator, io: std.Io, suffix: []
 }
 
 test "shard validation streams oversized frames and accepts the result" {
-    const support = @import("regression_support");
+    const support = @import("test_support");
     const allocator = std.testing.allocator;
     const padding = try allocator.alloc(u8, 32 * 1024);
     defer allocator.free(padding);
@@ -904,15 +905,16 @@ test "shard validation streams oversized frames and accepts the result" {
     var client = try Client.init(allocator, std.testing.io, server.origin, "");
     defer client.deinit();
     try client.putShard("shard");
-    try server.finish(1);
+    try server.finish();
+    try std.testing.expectEqual(@as(usize, 1), server.exchanges.items.len);
 }
 
 test "CAS endpoints add v1 to a bare loopback origin" {
-    try checkRegressionEndpoints(std.testing.allocator, std.testing.io, "");
+    try checkCasEndpoints(std.testing.allocator, std.testing.io, "");
 }
 
 test "CAS endpoints preserve exactly one v1 for a versioned origin" {
-    try checkRegressionEndpoints(std.testing.allocator, std.testing.io, "/v1");
+    try checkCasEndpoints(std.testing.allocator, std.testing.io, "/v1");
 }
 
 test "parse a CAS reconstruction plan strictly" {
@@ -973,7 +975,7 @@ test "reconstruction ranges reject inclusive length overflow" {
 }
 
 test "GlobalDedup caches remote misses but retries errors for the same hash" {
-    const support = @import("regression_support");
+    const support = @import("test_support");
     const allocator = std.testing.allocator;
     const responses = [_]support.HttpResponse{
         .{ .status = .not_found },
@@ -1000,11 +1002,14 @@ test "GlobalDedup caches remote misses but retries errors for the same hash" {
     try std.testing.expectError(error.ServerError, global.fetch(allocator, failed_hash));
     try std.testing.expect(!global.missed_remote.contains(failed_hash));
     try std.testing.expectError(error.ServerError, global.fetch(allocator, failed_hash));
-    try server.finish(3);
+    try server.finish();
+    try std.testing.expectEqual(@as(usize, 3), server.exchanges.items.len);
 }
 
-test "malformed CAS responses are rejected" {
-    const allocator = std.testing.allocator;
-    try std.testing.expectError(error.InvalidResponse, parsePlan(allocator, "{}", null, 1));
-    try std.testing.expectError(error.SyntaxError, parsePlan(allocator, "not json", null, 1));
+test "CAS reconstruction plan rejects missing fields" {
+    try std.testing.expectError(error.InvalidResponse, parsePlan(std.testing.allocator, "{}", null, 1));
+}
+
+test "CAS reconstruction plan rejects malformed JSON" {
+    try std.testing.expectError(error.SyntaxError, parsePlan(std.testing.allocator, "not json", null, 1));
 }

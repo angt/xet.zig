@@ -268,10 +268,13 @@ test "a boundary match beyond the maximum still cuts at the maximum" {
     try std.testing.expectEqual(constants.max_chunk_size, result.chunk.?.data.len);
 }
 
-test "empty and tiny inputs" {
+test "empty input produces no chunks" {
     const empty = try chunkBuffer(std.testing.allocator, "");
     defer std.testing.allocator.free(empty);
     try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "tiny input produces one complete chunk" {
     const tiny = try chunkBuffer(std.testing.allocator, "hello");
     defer std.testing.allocator.free(tiny);
     try std.testing.expectEqual(@as(usize, 1), tiny.len);

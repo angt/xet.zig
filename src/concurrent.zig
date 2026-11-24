@@ -640,7 +640,7 @@ test "whole-file identity rejects corruption without changing the consume API" {
     }));
 }
 
-test "upload errors drain outstanding tasks before returning" {
+test "upload errors drain outstanding tasks before finish returns" {
     const allocator = std.testing.allocator;
     const TestStore = struct {
         calls: usize = 0,
@@ -668,7 +668,7 @@ test "upload errors drain outstanding tasks before returning" {
     try std.testing.expectEqual(@as(usize, 0), uploader.in_flight);
 }
 
-test "concurrent upload sends the shard after every xorb" {
+test "concurrent upload completes every xorb before storing the shard" {
     const allocator = std.testing.allocator;
     const TestStore = struct {
         completed: usize = 0,

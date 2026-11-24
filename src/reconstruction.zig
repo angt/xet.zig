@@ -488,7 +488,7 @@ test "location lookup skips inverted ranges even when a valid duplicate follows"
     try std.testing.expectEqualStrings("memory://valid", findLocation(&locations, term).?.url);
 }
 
-fn expectNoEmptyWrites() !void {
+test "reconstruction does not emit empty writes" {
     const allocator = std.testing.allocator;
     const chunks = [_]xorb.Chunk{
         .{ .data = "AAA", .hash = hashing.data("AAA") },
@@ -543,10 +543,6 @@ fn expectNoEmptyWrites() !void {
     try std.testing.expectEqual(@as(usize, 0), context.empty_writes);
 }
 
-test "reconstruction does not emit empty writes" {
-    try expectNoEmptyWrites();
-}
-
 test "shard plans validate Merkle roots and preserve every selected chunk" {
     const allocator = std.testing.allocator;
     const data = try allocator.alloc(u8, 300_000);
@@ -566,8 +562,20 @@ test "shard plans validate Merkle roots and preserve every selected chunk" {
     var total: u64 = 0;
     for (result.chunks) |chunk| total += chunk.size;
     try std.testing.expectEqual(@as(u64, data.len), total);
-    try std.testing.expectError(error.NotFound, validateShardFile(allocator, package.shard_bytes, hashing.zero));
+}
 
+test "shard validation reports a missing file" {
+    const allocator = std.testing.allocator;
+    const package = try @import("store.zig").pack(allocator, "data", .{});
+    defer {
+        var mutable = package;
+        mutable.deinit(allocator);
+    }
+    try std.testing.expectError(error.NotFound, validateShardFile(allocator, package.shard_bytes, hashing.zero));
+}
+
+test "shard plan for an empty file contains no chunks" {
+    const allocator = std.testing.allocator;
     const empty = try @import("store.zig").pack(allocator, "", .{});
     defer {
         var mutable = empty;
@@ -577,6 +585,15 @@ test "shard plans validate Merkle roots and preserve every selected chunk" {
     defer empty_plan.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 0), empty_plan.size);
     try std.testing.expectEqual(@as(usize, 0), empty_plan.chunks.len);
+}
+
+test "shard validation rejects a corrupted file Merkle root" {
+    const allocator = std.testing.allocator;
+    const empty = try @import("store.zig").pack(allocator, "", .{});
+    defer {
+        var mutable = empty;
+        mutable.deinit(allocator);
+    }
     @memset(empty.shard_bytes[shard.header_size..][0..hashing.zero.len], 1);
     try std.testing.expectError(error.HashMismatch, validateShardFile(allocator, empty.shard_bytes, null));
 }

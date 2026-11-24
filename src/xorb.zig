@@ -520,7 +520,7 @@ pub fn verify(allocator: std.mem.Allocator, input: []const u8) !void {
 }
 
 test "serialize releases direct compression scratch after allocation failures" {
-    const support = @import("regression_support");
+    const support = @import("test_support");
     var first: [65_536]u8 = undefined;
     var second: [32_768]u8 = undefined;
     for (&first, 0..) |*byte, index| byte.* = @truncate(index *% 73 +% index / 131);
@@ -557,7 +557,7 @@ test "serialize releases direct compression scratch after allocation failures" {
 }
 
 test "incremental serialization is identical and retryable after allocation failure" {
-    const support = @import("regression_support");
+    const support = @import("test_support");
     const allocator = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(42);
     var input: [128 * 1024]u8 = undefined;
@@ -689,7 +689,7 @@ test "incremental decoding handles one-byte reads and skipped chunks" {
 }
 
 test "compressed decoders reuse scratch across every chunk" {
-    const support = @import("regression_support");
+    const support = @import("test_support");
     const allocator = std.testing.allocator;
     const chunks = [_]Chunk{
         .{ .data = "first", .hash = hashing.data("first") },
@@ -737,7 +737,7 @@ test "compressed decoders reuse scratch across every chunk" {
 }
 
 test "verification decode allocations do not scale with chunk count" {
-    const support = @import("regression_support");
+    const support = @import("test_support");
     const allocator = std.testing.allocator;
     const first: [256]u8 = @splat(1);
     const second: [256]u8 = @splat(2);
@@ -839,7 +839,7 @@ test "incremental decoding composes with fixed standard readers and writers" {
     try std.testing.expectEqualStrings("firstsecond", writer.buffered());
 }
 
-test "raw chunk ranges and malformed input" {
+test "footerless raw xorb decodes the requested chunk range" {
     const allocator = std.testing.allocator;
     const chunks = [_]Chunk{
         .{ .data = "zero", .hash = hashing.data("zero") },
@@ -851,9 +851,21 @@ test "raw chunk ranges and malformed input" {
     var decoded = try decodeRange(allocator, object.bytes[0..footer.body_length], 0, 2);
     defer decoded.deinit(allocator);
     try std.testing.expectEqualStrings("zeroone", decoded.bytes);
-    try std.testing.expectError(error.InvalidRange, decodeRange(allocator, object.bytes, 2, 2));
+}
+
+test "xorb decoding rejects an empty requested range" {
+    const chunks = [_]Chunk{.{ .data = "chunk", .hash = hashing.data("chunk") }};
+    var object = try serialize(std.testing.allocator, &chunks, .none);
+    defer object.deinit(std.testing.allocator);
+    try std.testing.expectError(error.InvalidRange, decodeRange(std.testing.allocator, object.bytes, 1, 1));
+}
+
+test "xorb verification rejects a corrupted footer length" {
+    const chunks = [_]Chunk{.{ .data = "chunk", .hash = hashing.data("chunk") }};
+    var object = try serialize(std.testing.allocator, &chunks, .none);
+    defer object.deinit(std.testing.allocator);
     object.bytes[object.bytes.len - 1] ^= 1;
-    try std.testing.expectError(error.InvalidXorb, verify(allocator, object.bytes));
+    try std.testing.expectError(error.InvalidXorb, verify(std.testing.allocator, object.bytes));
 }
 
 test "verification binds every footer hash and boundary to its chunk" {
@@ -905,7 +917,7 @@ test "decoders reject zero-length chunks" {
 }
 
 test "decodeRange allocation failures release every completed transfer" {
-    const support = @import("regression_support");
+    const support = @import("test_support");
     const chunks = [_]Chunk{
         .{ .data = "zero", .hash = hashing.data("zero") },
         .{ .data = "one", .hash = hashing.data("one") },

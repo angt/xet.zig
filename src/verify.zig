@@ -64,7 +64,7 @@ pub const Verifier = struct {
 };
 
 test "verifier writer preserves allocation failures and releases pending input" {
-    const support = @import("regression_support");
+    const support = @import("test_support");
     var tracker = support.TrackingAllocator{ .backing = std.testing.allocator, .fail_at = 0 };
     defer tracker.deinit();
     var verifier = Verifier.init(tracker.allocator(), null);

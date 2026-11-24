@@ -281,6 +281,22 @@ fn keyed(key: hashing.Hash, hash: hashing.Hash) hashing.Hash {
     return hashing.keyed(key, &hash);
 }
 
+test "dedup source rejects invalid matches and releases their nodes" {
+    const Context = struct {
+        fn query(_: *anyopaque, allocator: std.mem.Allocator, _: []const hashing.Hash) !?Match {
+            const nodes = try allocator.alloc(hashing.Node, 1);
+            nodes[0] = .{ .hash = hashing.data("wrong"), .size = 3 };
+            return .{ .nodes = nodes, .xorb_hash = hashing.zero, .chunk_index_start = 0 };
+        }
+    };
+    var dummy: u8 = 0;
+    const source = Source{ .context = &dummy, .query_fn = Context.query };
+    try std.testing.expectError(
+        error.InvalidDedupMatch,
+        source.query(std.testing.allocator, &.{hashing.data("AAA")}),
+    );
+}
+
 test "session lookup owns Xorb metadata and returns contiguous runs" {
     const allocator = std.testing.allocator;
     const hashes = [_]hashing.Hash{ hashing.data("A"), hashing.data("B"), hashing.data("C") };
@@ -305,42 +321,94 @@ test "session lookup owns Xorb metadata and returns contiguous runs" {
     try std.testing.expectEqual(@as(u32, 3), try match.unpackedBytes());
 }
 
-test "session rollback restores shadowed mappings and removes new chunks" {
-    const allocator = std.testing.allocator;
-    const shared_hash = hashing.data("shared");
-    const new_hash = hashing.data("new");
-    const old_hash = hashing.data("old xorb");
-    const new_xorb_hash = hashing.data("new xorb");
-    var session = SessionIndex.init(allocator);
-    defer session.deinit();
+fn addSessionXorb(
+    session: *SessionIndex,
+    name: []const u8,
+    chunks: []const shard.Chunk,
+) !void {
     try session.addXorb(.{
-        .hash = old_hash,
-        .chunks = &.{.{ .hash = shared_hash, .byte_range_start = 0, .unpacked_segment_bytes = 1 }},
+        .hash = hashing.data(name),
+        .chunks = chunks,
         .raw_size = 1,
         .serialized_size = 1,
     });
-    var point = session.checkpoint();
-    var active = true;
-    defer if (active) point.deinit(allocator);
-    try session.addXorbTracked(.{
-        .hash = new_xorb_hash,
-        .chunks = &.{
-            .{ .hash = shared_hash, .byte_range_start = 0, .unpacked_segment_bytes = 2 },
-            .{ .hash = new_hash, .byte_range_start = 0, .unpacked_segment_bytes = 3 },
-        },
-        .raw_size = 5,
-        .serialized_size = 5,
-    }, &point);
-    var optional_point: ?SessionIndex.Checkpoint = point;
-    session.rollback(&optional_point);
-    active = false;
+}
 
-    var match = (try session.source().query(allocator, &.{shared_hash})).?;
-    defer match.deinit(allocator);
-    try std.testing.expectEqual(old_hash, match.xorb_hash);
-    try std.testing.expectEqual(@as(u64, 1), match.nodes[0].size);
-    try std.testing.expect((try session.source().query(allocator, &.{new_hash})) == null);
+fn expectSessionChunk(
+    session: *SessionIndex,
+    chunk_hash: hashing.Hash,
+    xorb_name: []const u8,
+    size: u32,
+) !void {
+    var match = (try session.source().query(std.testing.allocator, &.{chunk_hash})).?;
+    defer match.deinit(std.testing.allocator);
+    try std.testing.expectEqual(hashing.data(xorb_name), match.xorb_hash);
+    try std.testing.expectEqual(@as(usize, 1), match.nodes.len);
+    try std.testing.expectEqual(size, match.nodes[0].size);
+}
+
+test "session rollback restores shadowed mappings and removes new chunks" {
+    const allocator = std.testing.allocator;
+    var session = SessionIndex.init(allocator);
+    defer session.deinit();
+    const shared = hashing.data("shared");
+    const stable = hashing.data("stable");
+    const added = hashing.data("added");
+    try addSessionXorb(&session, "old", &.{
+        .{ .hash = shared, .byte_range_start = 0, .unpacked_segment_bytes = 1 },
+        .{ .hash = stable, .byte_range_start = 1, .unpacked_segment_bytes = 2 },
+    });
+    var point: ?SessionIndex.Checkpoint = session.checkpoint();
+    try addSessionXorb(&session, "new", &.{
+        .{ .hash = shared, .byte_range_start = 0, .unpacked_segment_bytes = 3 },
+        .{ .hash = added, .byte_range_start = 1, .unpacked_segment_bytes = 4 },
+    });
+    try addSessionXorb(&session, "newest", &.{
+        .{ .hash = shared, .byte_range_start = 0, .unpacked_segment_bytes = 5 },
+        .{ .hash = added, .byte_range_start = 1, .unpacked_segment_bytes = 6 },
+    });
+    try expectSessionChunk(&session, shared, "newest", 5);
+    try expectSessionChunk(&session, added, "newest", 6);
+
+    session.rollback(&point);
+    try std.testing.expect(point == null);
     try std.testing.expectEqual(@as(usize, 1), session.xorbs.items.len);
+    try expectSessionChunk(&session, shared, "old", 1);
+    try expectSessionChunk(&session, stable, "old", 2);
+    try std.testing.expect((try session.source().query(allocator, &.{added})) == null);
+}
+
+test "session rollback after insertion allocation failure restores prior mappings" {
+    const support = @import("test_support");
+    var tracker = support.TrackingAllocator{ .backing = std.testing.allocator };
+    defer tracker.deinit();
+    const allocator = tracker.allocator();
+    {
+        var session = SessionIndex.init(allocator);
+        defer session.deinit();
+        const shared = hashing.data("shared");
+        const added = hashing.data("added");
+        try addSessionXorb(&session, "old", &.{
+            .{ .hash = shared, .byte_range_start = 0, .unpacked_segment_bytes = 1 },
+        });
+        var point: ?SessionIndex.Checkpoint = session.checkpoint();
+        try addSessionXorb(&session, "new", &.{
+            .{ .hash = shared, .byte_range_start = 0, .unpacked_segment_bytes = 2 },
+            .{ .hash = added, .byte_range_start = 1, .unpacked_segment_bytes = 3 },
+        });
+        tracker.fail_at = tracker.allocation_count;
+        try std.testing.expectError(error.OutOfMemory, addSessionXorb(&session, "failed", &.{
+            .{ .hash = shared, .byte_range_start = 0, .unpacked_segment_bytes = 4 },
+        }));
+        tracker.fail_at = null;
+
+        session.rollback(&point);
+        try expectSessionChunk(&session, shared, "old", 1);
+        try std.testing.expect((try session.source().query(allocator, &.{added})) == null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), tracker.duplicate_frees);
+    try std.testing.expectEqual(@as(usize, 0), tracker.invalid_frees);
+    try std.testing.expectEqual(@as(usize, 0), tracker.outstanding());
 }
 
 test "global shard lookup honors HMAC keys and contiguous runs" {
@@ -440,7 +508,7 @@ test "ShardIndex evicts oldest shards within its byte limit" {
 }
 
 test "ShardIndex rejects oversized input and consumes it on allocation failure" {
-    const support = @import("regression_support");
+    const support = @import("test_support");
     const chunk = shard.Chunk{
         .hash = hashing.data("chunk"),
         .byte_range_start = 0,

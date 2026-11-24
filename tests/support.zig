@@ -1,7 +1,7 @@
 const std = @import("std");
 const xet = @import("xet");
 
-pub const AllocEvent = struct {
+const AllocEvent = struct {
     bytes: []u8,
     alignment: std.mem.Alignment,
     live: bool = true,
@@ -174,40 +174,6 @@ pub const MemoryStore = struct {
     }
 };
 
-pub const SinkBuffer = std.Io.Writer.Allocating;
-
-pub const SliceOpener = struct {
-    bytes: []const u8,
-    requests: usize = 0,
-    closes: usize = 0,
-    last_range: ?xet.reconstruction.ByteRange = .{ .start = 0, .end = 0 },
-    reader: std.Io.Reader = undefined,
-
-    pub fn opener(self: *SliceOpener) xet.stream.Opener {
-        return .{ .context = self, .open_fn = open, .close_fn = close };
-    }
-
-    fn open(raw: *anyopaque, request: xet.reconstruction.Request) !*std.Io.Reader {
-        const self: *SliceOpener = @ptrCast(@alignCast(raw));
-        self.requests += 1;
-        self.last_range = request.byte_range;
-        const range = request.byte_range orelse xet.reconstruction.ByteRange{
-            .start = 0,
-            .end = @intCast(self.bytes.len - 1),
-        };
-        const start: usize = @intCast(range.start);
-        const end: usize = @intCast(range.end + 1);
-        if (start > end or end > self.bytes.len) return error.TestRangeOutsideFixture;
-        self.reader = .fixed(self.bytes[start..end]);
-        return &self.reader;
-    }
-
-    fn close(raw: *anyopaque, _: *std.Io.Reader) void {
-        const self: *SliceOpener = @ptrCast(@alignCast(raw));
-        self.closes += 1;
-    }
-};
-
 pub const HttpResponse = struct {
     status: std.http.Status = .ok,
     body: []const u8 = "",
@@ -263,10 +229,9 @@ pub const Loopback = struct {
         try self.start();
     }
 
-    pub fn finish(self: *Loopback, count: usize) !void {
+    pub fn finish(self: *Loopback) !void {
         try std.testing.expectEqual(@as(usize, 1), self.futures.items.len);
         self.futures.items[0].await(self.io);
-        try std.testing.expectEqual(count, self.exchanges.items.len);
     }
 
     pub fn deinit(self: *Loopback) void {
@@ -416,4 +381,58 @@ pub fn syntheticHash(domain: u8, index: usize) xet.Hash {
     digest[0] = domain;
     std.mem.writeInt(u64, digest[24..32], index, .little);
     return digest;
+}
+
+pub fn makeGlobalDedupShard(
+    allocator: std.mem.Allocator,
+    object: *const xet.xorb.Serialized,
+    key: ?xet.Hash,
+) ![]u8 {
+    const chunks = try allocator.dupe(xet.shard.Chunk, object.chunks);
+    defer allocator.free(chunks);
+    if (key) |hmac_key| {
+        for (chunks) |*chunk| chunk.hash = xet.hash.keyed(hmac_key, &chunk.hash);
+    }
+    const metadata = xet.shard.Xorb{
+        .hash = object.hash,
+        .chunks = chunks,
+        .raw_size = @intCast(object.raw_size),
+        .serialized_size = @intCast(object.body_length),
+    };
+    const bytes = try xet.shard.serialize(allocator, &.{}, &.{metadata});
+    if (key) |hmac_key| @memcpy(bytes[bytes.len - xet.shard.footer_size + 72 ..][0..32], &hmac_key);
+    return bytes;
+}
+
+pub fn deterministicData(allocator: std.mem.Allocator) ![]u8 {
+    const data = try allocator.alloc(u8, 600_000);
+    for (data, 0..) |*byte, index| byte.* = @truncate(index *% 73 +% index / 131);
+    return data;
+}
+
+pub const result_json =
+    \\{"type":"result"}
+;
+pub const validating_frame =
+    \\{"type":"validating","verified":1,"total":1}
+;
+pub const upload_error_frame =
+    \\{"type":"error","message":"rejected","retryable":false}
+;
+
+pub fn checkXorbBody(body: []const u8) !void {
+    const golden = [_]u8{ 0, 3, 0, 0, 0, 3, 0, 0, 'A', 'A', 'A' };
+    try std.testing.expectEqualSlices(u8, &golden, body);
+}
+
+pub fn checkShardBody(shard_bytes: []const u8) !void {
+    const cas_bookend = @as([32]u8, @splat(0xff)) ++ @as([16]u8, @splat(0));
+    const cas_end = std.mem.lastIndexOf(u8, shard_bytes, &cas_bookend) orelse
+        return error.TestMissingCasBookend;
+    const footer_offset = std.mem.readInt(u64, shard_bytes[40..48], .little);
+    try std.testing.expectEqual(@as(u64, 0), footer_offset);
+    try std.testing.expectEqual(cas_end + cas_bookend.len, shard_bytes.len);
+    if (cas_end < 96) return error.TestTruncatedCasSection;
+    const xorb_record = cas_end - 96;
+    try std.testing.expectEqual(@as(u32, 11), std.mem.readInt(u32, shard_bytes[xorb_record + 44 ..][0..4], .little));
 }
