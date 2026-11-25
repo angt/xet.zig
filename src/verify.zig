@@ -12,7 +12,23 @@ pub const Verifier = struct {
     error_value: ?anyerror = null,
 
     pub fn init(allocator: std.mem.Allocator, output: ?*std.Io.Writer) Verifier {
-        return .{ .allocator = allocator, .chunker = chunker.Chunker.init(), .output = output };
+        return initWith(allocator, output, null);
+    }
+
+    /// A null strategy verifies the canonical Xet file identity
+    pub fn initWith(
+        allocator: std.mem.Allocator,
+        output: ?*std.Io.Writer,
+        strategy: ?chunker.Strategy,
+    ) Verifier {
+        return .{
+            .allocator = allocator,
+            .chunker = if (strategy) |value|
+                chunker.Chunker.initWith(value)
+            else
+                chunker.Chunker.init(),
+            .output = output,
+        };
     }
 
     pub fn deinit(self: *Verifier) void {

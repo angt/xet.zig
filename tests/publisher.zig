@@ -385,9 +385,9 @@ const MaxChunkComparison = struct {
 fn compareMaxChunkEntryPoints(allocator: std.mem.Allocator) !MaxChunkComparison {
     const data = try support.deterministicData(allocator);
     defer allocator.free(data);
-    const options = xet.PackOptions{ .compression = .none, .max_xorb_size = 64 * 1024 * 1024, .max_xorb_chunks = 1 };
+    const opts = xet.PackOptions{ .compression = .none, .max_xorb_size = 64 * 1024 * 1024, .max_xorb_chunks = 1 };
     var result: MaxChunkComparison = .{
-        .package = try xet.pack(allocator, data, options),
+        .package = try xet.pack(allocator, data, opts),
         .result = undefined,
         .packed_store = .{ .allocator = allocator },
         .streamed = .{ .allocator = allocator },
@@ -397,7 +397,7 @@ fn compareMaxChunkEntryPoints(allocator: std.mem.Allocator) !MaxChunkComparison 
     var publisher = try xet.StorePublisher.init(
         allocator,
         result.streamed.store(),
-        xet.PublisherOptions.fromPackOptions(options),
+        xet.PublisherOptions.fromPack(opts),
     );
     defer publisher.deinit();
     try publisher.write(data);

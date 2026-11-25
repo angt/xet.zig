@@ -34,6 +34,7 @@ pub const PackOptions = struct {
     compression: xorb.Compression = .lz4,
     max_xorb_size: u64 = constants.max_xorb_size,
     max_xorb_chunks: u32 = constants.max_xorb_chunks,
+    strategy: ?chunker.Strategy = null,
 
     pub fn validate(self: PackOptions) !void {
         if (self.max_xorb_size == 0 or self.max_xorb_size > constants.max_xorb_size or
@@ -51,14 +52,16 @@ pub const PublisherOptions = struct {
     compression: xorb.Compression = .lz4,
     max_xorb_size: u64 = constants.max_xorb_size,
     max_xorb_chunks: u32 = constants.max_xorb_chunks,
+    strategy: ?chunker.Strategy = null,
     dedup_source: ?DedupSource = null,
     new_xorb_listener: ?NewXorbListener = null,
 
-    pub fn fromPackOptions(options: PackOptions) PublisherOptions {
+    pub fn fromPack(opts: PackOptions) PublisherOptions {
         return .{
-            .compression = options.compression,
-            .max_xorb_size = options.max_xorb_size,
-            .max_xorb_chunks = options.max_xorb_chunks,
+            .compression = opts.compression,
+            .max_xorb_size = opts.max_xorb_size,
+            .max_xorb_chunks = opts.max_xorb_chunks,
+            .strategy = opts.strategy,
         };
     }
 
@@ -67,6 +70,7 @@ pub const PublisherOptions = struct {
             .compression = self.compression,
             .max_xorb_size = self.max_xorb_size,
             .max_xorb_chunks = self.max_xorb_chunks,
+            .strategy = self.strategy,
         });
     }
 };
@@ -89,10 +93,10 @@ pub const Package = struct {
 pub fn pack(
     allocator: std.mem.Allocator,
     input: []const u8,
-    options: PackOptions,
+    opts: PackOptions,
 ) !Package {
-    try options.validate();
-    const chunks = try chunker.chunkBuffer(allocator, input);
+    try opts.validate();
+    const chunks = try chunker.chunkWith(allocator, input, opts.strategy);
     defer allocator.free(chunks);
     const source_chunks = try allocator.alloc(xorb.Chunk, chunks.len);
     defer allocator.free(source_chunks);
@@ -121,13 +125,13 @@ pub fn pack(
     while (first < source_chunks.len) {
         var end = first;
         var bytes: u64 = 0;
-        while (end < source_chunks.len and end - first < options.max_xorb_chunks) {
+        while (end < source_chunks.len and end - first < opts.max_xorb_chunks) {
             const next_size = bytes + source_chunks[end].data.len;
-            if (end != first and next_size > options.max_xorb_size) break;
+            if (end != first and next_size > opts.max_xorb_size) break;
             bytes = next_size;
             end += 1;
         }
-        const object = try xorb.serialize(allocator, source_chunks[first..end], options.compression);
+        const object = try xorb.serialize(allocator, source_chunks[first..end], opts.compression);
         objects.append(allocator, object) catch |err| {
             var owned = object;
             owned.deinit(allocator);
@@ -402,7 +406,7 @@ pub const dedup_window = 64;
 pub const Publisher = struct {
     allocator: std.mem.Allocator,
     destination: Store,
-    options: PublisherOptions,
+    opts: PublisherOptions,
     chunker: chunker.Chunker,
     serializer: xorb.Serializer,
     file_nodes: hashing.Aggregator = .{},
@@ -422,14 +426,17 @@ pub const Publisher = struct {
     pending_len: usize = 0,
 
     /// Borrows the dedup source, listener, and callback metadata
-    pub fn init(allocator: std.mem.Allocator, destination: Store, options: PublisherOptions) !Publisher {
-        try options.validate();
+    pub fn init(allocator: std.mem.Allocator, destination: Store, opts: PublisherOptions) !Publisher {
+        try opts.validate();
         return .{
             .allocator = allocator,
             .destination = destination,
-            .options = options,
-            .chunker = chunker.Chunker.init(),
-            .serializer = .init(options.compression),
+            .opts = opts,
+            .chunker = if (opts.strategy) |strategy|
+                chunker.Chunker.initWith(strategy)
+            else
+                chunker.Chunker.init(),
+            .serializer = .init(opts.compression),
         };
     }
 
@@ -625,7 +632,7 @@ pub const Publisher = struct {
     }
 
     fn addChunk(self: *Publisher, chunk: chunker.Chunk) !void {
-        if (self.options.dedup_source) |source| {
+        if (self.opts.dedup_source) |source| {
             if (self.pending_len == dedup_window) try self.processOne(source);
             try self.buffer(chunk);
             return;
@@ -650,7 +657,7 @@ pub const Publisher = struct {
     }
 
     fn processPending(self: *Publisher) !void {
-        const source = self.options.dedup_source orelse return;
+        const source = self.opts.dedup_source orelse return;
         while (self.pending_len != 0) try self.processOne(source);
     }
 
@@ -673,15 +680,15 @@ pub const Publisher = struct {
 
     fn addNew(self: *Publisher, chunk: chunker.Chunk) !void {
         self.resetReuse();
-        const flush = self.serializer.chunks.items.len == self.options.max_xorb_chunks or
+        const flush = self.serializer.chunks.items.len == self.opts.max_xorb_chunks or
             (self.serializer.raw_size != 0 and
-                self.serializer.raw_size + chunk.data.len > self.options.max_xorb_size);
+                self.serializer.raw_size + chunk.data.len > self.opts.max_xorb_size);
         if (flush) {
             try self.flushXorb();
         }
         self.size = std.math.add(u64, self.size, chunk.data.len) catch return error.FileTooLarge;
         try self.serializer.add(self.allocator, .{ .data = chunk.data, .hash = chunk.hash });
-        if (self.serializer.raw_size == self.options.max_xorb_size) try self.flushXorb();
+        if (self.serializer.raw_size == self.opts.max_xorb_size) try self.flushXorb();
     }
 
     fn flushXorb(self: *Publisher) !void {
@@ -710,7 +717,7 @@ pub const Publisher = struct {
                 self.allocator.free(metadata);
                 return err;
             };
-            if (self.options.new_xorb_listener) |listener|
+            if (self.opts.new_xorb_listener) |listener|
                 try listener.callback(listener.context, self.xorbs.items[self.xorbs.items.len - 1]);
         }
         try self.segments.append(self.allocator, .{

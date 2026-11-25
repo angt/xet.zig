@@ -3,6 +3,7 @@
 const std = @import("std");
 const constants = @import("constants.zig");
 const hashing = @import("hash.zig");
+const chunker = @import("chunker.zig");
 const verify = @import("verify.zig");
 const reconstruction = @import("reconstruction.zig");
 const storage = @import("store.zig");
@@ -119,6 +120,7 @@ pub const ConsumeOptions = struct {
     window: usize = 4,
     /// Bounds prefetch by `window * max_term_size` and streams larger terms
     max_term_size: usize = constants.max_xorb_size,
+    strategy: ?chunker.Strategy = null,
 };
 
 /// Decode prefetched terms in file order
@@ -128,9 +130,9 @@ pub fn consume(
     plan: *const reconstruction.Plan,
     opener: stream.Opener,
     sink: *std.Io.Writer,
-    options: ConsumeOptions,
+    opts: ConsumeOptions,
 ) !u64 {
-    if (options.window == 0 or options.max_term_size == 0) return error.InvalidConcurrency;
+    if (opts.window == 0 or opts.max_term_size == 0) return error.InvalidConcurrency;
     try plan.validate();
     const wanted = plan.output_length orelse blk: {
         var total: u64 = 0;
@@ -140,14 +142,14 @@ pub fn consume(
     for (plan.terms) |term| {
         const location = reconstruction.findLocation(plan.locations, term) orelse return error.MissingLocation;
         const byte_range = location.byte_range orelse
-            return reconstruction.consume(allocator, plan, opener, sink);
+            return reconstruction.consumeWith(allocator, plan, opener, sink, opts.strategy);
         const size = try stream.rangeLength(byte_range);
-        if (size > options.max_term_size)
-            return reconstruction.consume(allocator, plan, opener, sink);
+        if (size > opts.max_term_size)
+            return reconstruction.consumeWith(allocator, plan, opener, sink, opts.strategy);
     }
 
     var verifier: ?verify.Verifier = if (plan.file_hash != null)
-        verify.Verifier.init(allocator, sink)
+        verify.Verifier.initWith(allocator, sink, opts.strategy)
     else
         null;
     defer if (verifier) |*value| value.deinit();
@@ -159,16 +161,16 @@ pub fn consume(
         .wanted = wanted,
         .skip = plan.offset_into_first_range,
     };
-    const completions = try allocator.alloc(TermCompletion, options.window);
+    const completions = try allocator.alloc(TermCompletion, opts.window);
     defer allocator.free(completions);
     var select: std.Io.Select(TermCompletion) = .init(io, completions);
-    const tasks = try allocator.alloc(?*TermTask, options.window);
+    const tasks = try allocator.alloc(?*TermTask, opts.window);
     defer allocator.free(tasks);
     @memset(tasks, null);
     defer for (tasks) |maybe_task| {
         if (maybe_task) |task| task.deinit();
     };
-    const completed = try allocator.alloc(bool, options.window);
+    const completed = try allocator.alloc(bool, opts.window);
     defer allocator.free(completed);
     @memset(completed, false);
     // Workers must stop before their tasks and context are freed
@@ -177,25 +179,25 @@ pub fn consume(
     var next: usize = 0;
     var current: usize = 0;
     while (current < plan.terms.len and context.written != wanted) {
-        while (next - current < options.window and next < plan.terms.len) {
+        while (next - current < opts.window and next < plan.terms.len) {
             const task = try allocator.create(TermTask);
             errdefer allocator.destroy(task);
             task.* = .{ .context = &context, .index = next };
-            tasks[next % options.window] = task;
-            completed[next % options.window] = false;
+            tasks[next % opts.window] = task;
+            completed[next % opts.window] = false;
             next += 1;
             select.concurrent(.result, fetch, .{task}) catch |err| switch (err) {
                 error.ConcurrencyUnavailable => select.async(.result, fetch, .{task}),
             };
         }
-        const task = tasks[current % options.window].?;
-        while (!completed[current % options.window]) {
+        const task = tasks[current % opts.window].?;
+        while (!completed[current % opts.window]) {
             const finished = (try select.await()).result.?;
             // Await synchronizes task writes while allowing out-of-order completion
-            completed[finished.index % options.window] = true;
+            completed[finished.index % opts.window] = true;
             if (finished.err) |err| return err;
         }
-        tasks[current % options.window] = null;
+        tasks[current % opts.window] = null;
         const decoded = decode(task, &context) catch |err| {
             task.deinit();
             if (verifier) |*value| return value.failure(err);
@@ -638,6 +640,153 @@ test "whole-file identity rejects corruption without changing the consume API" {
         .window = 2,
         .max_term_size = object.body_length,
     }));
+}
+
+/// Fixed-size strategy so a file hash only matches when the caller's boundaries are used
+const FixedChunks = struct {
+    size: usize,
+
+    fn strategy(self: *const FixedChunks) chunker.Strategy {
+        return .{ .context = @constCast(self), .next_fn = next };
+    }
+
+    fn next(raw: *anyopaque, previous: []const u8, input: []const u8) !?usize {
+        const self: *const FixedChunks = @ptrCast(@alignCast(raw));
+        const remaining = self.size -| previous.len;
+        if (remaining == 0) return error.InvalidChunkBoundary;
+        if (input.len < remaining) return null;
+        return remaining;
+    }
+};
+
+test "concurrent fallbacks keep the caller chunk strategy for whole-file verification" {
+    const allocator = std.testing.allocator;
+    const data = "alphabeta!";
+    const chunks = [_]xorb.Chunk{
+        .{ .data = "alpha", .hash = hashing.data("alpha") },
+        .{ .data = "beta!", .hash = hashing.data("beta!") },
+    };
+    var object = try xorb.serialize(allocator, &chunks, .none);
+    defer object.deinit(allocator);
+    const terms = [_]reconstruction.Term{.{
+        .hash = object.hash,
+        .unpacked_length = 10,
+        .range = .{ .start = 0, .end = 2 },
+    }};
+    var fixed = FixedChunks{ .size = 5 };
+    const fixed_chunks = try chunker.chunkWith(allocator, data, fixed.strategy());
+    defer allocator.free(fixed_chunks);
+    try std.testing.expectEqual(@as(usize, 2), fixed_chunks.len);
+    const nodes = try allocator.alloc(hashing.Node, fixed_chunks.len);
+    defer allocator.free(nodes);
+    for (fixed_chunks, nodes) |chunk, *node| node.* = .{ .hash = chunk.hash, .size = chunk.data.len };
+    const expected = try hashing.file(allocator, nodes);
+
+    const cases = [_]struct {
+        name: []const u8,
+        location: reconstruction.Location,
+        opts: ConsumeOptions,
+    }{
+        .{
+            .name = "complete object fallback",
+            .location = .{
+                .hash = object.hash,
+                .range = .{ .start = 0, .end = 2 },
+                .url = "memory://strategy",
+                .byte_range = null,
+            },
+            .opts = .{ .window = 2 },
+        },
+        .{
+            .name = "oversized term fallback",
+            .location = .{
+                .hash = object.hash,
+                .range = .{ .start = 0, .end = 2 },
+                .url = "memory://strategy",
+                .byte_range = .{ .start = 0, .end = @intCast(object.bytes.len - 1) },
+            },
+            .opts = .{ .window = 2, .max_term_size = 1 },
+        },
+    };
+    for (cases) |case| {
+        var plan = try reconstruction.Plan.init(allocator, &terms, &[_]reconstruction.Location{case.location});
+        defer plan.deinit(allocator);
+        plan.file_hash = expected;
+        var test_fetch = TestFetch{ .bytes = object.bytes };
+        defer test_fetch.output.deinit(allocator);
+        var opts = case.opts;
+        opts.strategy = fixed.strategy();
+        _ = try consume(allocator, std.testing.io, &plan, .{
+            .context = &test_fetch,
+            .open_fn = TestFetch.open,
+            .close_fn = TestFetch.close,
+            .read_error_fn = TestFetch.readError,
+        }, &test_fetch.writer, opts);
+        try std.testing.expectEqualStrings(data, test_fetch.output.items);
+
+        // Dropping the strategy must fall back to canonical boundaries and mismatch
+        test_fetch.output.clearRetainingCapacity();
+        var plain = case.opts;
+        plain.strategy = null;
+        try std.testing.expectError(error.HashMismatch, consume(
+            allocator,
+            std.testing.io,
+            &plan,
+            .{
+                .context = &test_fetch,
+                .open_fn = TestFetch.open,
+                .close_fn = TestFetch.close,
+                .read_error_fn = TestFetch.readError,
+            },
+            &test_fetch.writer,
+            plain,
+        ));
+    }
+}
+
+test "concurrent prefetch verifies with the caller chunk strategy" {
+    const allocator = std.testing.allocator;
+    const data = "alphabeta!";
+    const chunks = [_]xorb.Chunk{
+        .{ .data = "alpha", .hash = hashing.data("alpha") },
+        .{ .data = "beta!", .hash = hashing.data("beta!") },
+    };
+    var object = try xorb.serialize(allocator, &chunks, .none);
+    defer object.deinit(allocator);
+    const terms = [_]reconstruction.Term{.{
+        .hash = object.hash,
+        .unpacked_length = 10,
+        .range = .{ .start = 0, .end = 2 },
+    }};
+    const locations = [_]reconstruction.Location{.{
+        .hash = object.hash,
+        .range = .{ .start = 0, .end = 2 },
+        .url = "memory://strategy",
+        .byte_range = .{ .start = 0, .end = @intCast(object.bytes.len - 1) },
+    }};
+    var fixed = FixedChunks{ .size = 5 };
+    const fixed_chunks = try chunker.chunkWith(allocator, data, fixed.strategy());
+    defer allocator.free(fixed_chunks);
+    const nodes = try allocator.alloc(hashing.Node, fixed_chunks.len);
+    defer allocator.free(nodes);
+    for (fixed_chunks, nodes) |chunk, *node| node.* = .{ .hash = chunk.hash, .size = chunk.data.len };
+    var plan = try reconstruction.Plan.init(allocator, &terms, &locations);
+    defer plan.deinit(allocator);
+    plan.file_hash = try hashing.file(allocator, nodes);
+    var test_fetch = TestFetch{ .bytes = object.bytes };
+    defer test_fetch.output.deinit(allocator);
+    const count = try consume(allocator, std.testing.io, &plan, .{
+        .context = &test_fetch,
+        .open_fn = TestFetch.open,
+        .close_fn = TestFetch.close,
+        .read_error_fn = TestFetch.readError,
+    }, &test_fetch.writer, .{
+        .window = 2,
+        .max_term_size = object.bytes.len,
+        .strategy = fixed.strategy(),
+    });
+    try std.testing.expectEqual(@as(u64, 10), count);
+    try std.testing.expectEqualStrings(data, test_fetch.output.items);
 }
 
 test "upload errors drain outstanding tasks before finish returns" {

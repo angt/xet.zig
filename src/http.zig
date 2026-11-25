@@ -1,6 +1,7 @@
 //! Standard Xet CAS HTTP adapter without repository authentication
 
 const std = @import("std");
+const chunker = @import("chunker.zig");
 const hashing = @import("hash.zig");
 const reconstruction = @import("reconstruction.zig");
 const shard = @import("shard.zig");
@@ -83,13 +84,13 @@ pub const Client = struct {
     pub fn uploadSession(
         self: *Client,
         allocator: std.mem.Allocator,
-        options: storage.PackOptions,
+        opts: storage.PackOptions,
     ) !UploadSession {
-        try options.validate();
+        try opts.validate();
         return .{
             .client = self,
             .allocator = allocator,
-            .options = options,
+            .opts = opts,
             .global = .{
                 .client = self,
                 .io = self.http_client.io,
@@ -103,24 +104,37 @@ pub const Client = struct {
         self: *Client,
         allocator: std.mem.Allocator,
         input: []const u8,
-        options: storage.PackOptions,
+        opts: storage.PackOptions,
     ) !storage.PublishResult {
-        var session = try self.uploadSession(allocator, options);
+        var session = try self.uploadSession(allocator, opts);
         defer session.deinit();
         try session.addFile(input);
         try session.finish();
         return session.results()[0];
     }
 
-    /// Returns caller-owned bytes after downloading and verifying the file
+    /// Returns caller-owned bytes after canonical chunk-boundary verification
     pub fn download(
         self: *Client,
         allocator: std.mem.Allocator,
         file_hash: hashing.Hash,
     ) ![]u8 {
+        return self.downloadWith(allocator, file_hash, null);
+    }
+
+    /// A null strategy preserves canonical whole-file verification
+    pub fn downloadWith(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        file_hash: hashing.Hash,
+        strategy: ?chunker.Strategy,
+    ) ![]u8 {
         var plan = try self.getPlan(file_hash, null);
         defer plan.deinit(self.allocator);
-        return reconstruction.reconstruct(allocator, &plan, self.opener());
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        _ = try reconstruction.consumeWith(allocator, &plan, self.opener(), &output.writer, strategy);
+        return output.toOwnedSlice();
     }
 
     fn openObject(raw: *anyopaque, item: stream.Request) !*std.Io.Reader {
@@ -385,7 +399,7 @@ pub const UploadFile = struct {
 pub const UploadSession = struct {
     client: *Client,
     allocator: std.mem.Allocator,
-    options: storage.PackOptions,
+    opts: storage.PackOptions,
     global: GlobalDedup,
     batch: storage.BatchPublisher,
     results_list: std.ArrayList(storage.PublishResult) = .empty,
@@ -410,13 +424,13 @@ pub const UploadSession = struct {
         self.next_file_id +%= 1;
         self.global.beginFile();
         errdefer self.global.rollback();
-        var options = storage.PublisherOptions.fromPackOptions(self.options);
-        options.dedup_source = self.global.source();
-        options.new_xorb_listener = .{
+        var opts = storage.PublisherOptions.fromPack(self.opts);
+        opts.dedup_source = self.global.source();
+        opts.new_xorb_listener = .{
             .context = &self.global,
             .callback = GlobalDedup.addXorb,
         };
-        const publisher = try storage.Publisher.init(self.allocator, self.client.store(), options);
+        const publisher = try storage.Publisher.init(self.allocator, self.client.store(), opts);
         self.active_file_id = id;
         return .{ .session = self, .publisher = publisher, .id = id };
     }

@@ -1,6 +1,7 @@
 //! File reconstruction through caller-provided Xorb retrieval
 
 const std = @import("std");
+const chunker = @import("chunker.zig");
 const constants = @import("constants.zig");
 const hashing = @import("hash.zig");
 const verify = @import("verify.zig");
@@ -124,8 +125,20 @@ pub fn consume(
     opener: Opener,
     sink: *std.Io.Writer,
 ) !u64 {
+    return consumeWith(allocator, plan, opener, sink, null);
+}
+
+/// A null strategy preserves canonical whole-file verification
+/// Complete file hashes require the same boundaries used during upload
+pub fn consumeWith(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    opener: Opener,
+    sink: *std.Io.Writer,
+    strategy: ?chunker.Strategy,
+) !u64 {
     if (plan.file_hash) |expected| {
-        var verifier = verify.Verifier.init(allocator, sink);
+        var verifier = verify.Verifier.initWith(allocator, sink, strategy);
         defer verifier.deinit();
         const written = consumeUnverified(allocator, plan, opener, &verifier.interface) catch |err|
             return verifier.failure(err);

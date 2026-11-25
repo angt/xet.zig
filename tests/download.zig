@@ -43,6 +43,103 @@ test "simple HTTP upload and download keep client and operation allocators separ
     try std.testing.expectEqual(@as(usize, 0), tracker.duplicate_frees);
 }
 
+test "HTTP upload and download support fixed chunk boundaries" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const data = try support.deterministicData(allocator);
+    defer allocator.free(data);
+    var fixed = try xet.Fixed.init(16 * 1024);
+    const fixed_chunks = try xet.chunkWith(allocator, data, fixed.strategy());
+    defer allocator.free(fixed_chunks);
+    try std.testing.expect(fixed_chunks.len > 1);
+    const source_chunks = try allocator.alloc(xet.xorb.Chunk, fixed_chunks.len);
+    defer allocator.free(source_chunks);
+    const nodes = try allocator.alloc(xet.hash.Node, fixed_chunks.len);
+    defer allocator.free(nodes);
+    for (fixed_chunks, source_chunks, nodes) |chunk, *source, *node| {
+        source.* = .{ .data = chunk.data, .hash = chunk.hash };
+        node.* = .{ .hash = chunk.hash, .size = @intCast(chunk.data.len) };
+    }
+    const expected_hash = try xet.hash.file(allocator, nodes);
+    var object = try xet.xorb.serialize(allocator, source_chunks, .none);
+    defer object.deinit(allocator);
+    var responses = [_]support.HttpResponse{
+        .{ .status = .not_found },
+        .{},
+        .{ .status = .not_found },
+        .{ .body = support.result_json },
+        .{},
+        .{},
+        .{},
+        .{},
+    };
+    var server = try support.Loopback.init(allocator, io, &responses);
+    defer server.deinit();
+    const url = try server.objectUrl(allocator);
+    defer allocator.free(url);
+    const hash_hex = xet.hash.toHex(object.hash);
+    const terms = [_]ReconstructionTerm{.{
+        .hash = &hash_hex,
+        .unpacked_length = @intCast(data.len),
+        .range = .{ .start = 0, .end = @intCast(fixed_chunks.len) },
+    }};
+    const FetchInfo = struct {
+        range: xet.reconstruction.Range,
+        url: []const u8,
+        url_range: xet.reconstruction.ByteRange,
+    };
+    const locations = [_]FetchInfo{.{
+        .range = .{ .start = 0, .end = @intCast(fixed_chunks.len) },
+        .url = url,
+        .url_range = .{ .start = 0, .end = object.bytes.len - 1 },
+    }};
+    const Descriptor = struct {
+        chunks: xet.reconstruction.Range,
+        bytes: xet.reconstruction.ByteRange,
+    };
+    const Xorb = struct {
+        url: []const u8,
+        ranges: [1]Descriptor,
+    };
+    const v2_locations = [_]Xorb{.{
+        .url = url,
+        .ranges = .{.{
+            .chunks = locations[0].range,
+            .bytes = locations[0].url_range,
+        }},
+    }};
+    const body = try writeReconstructionJson(allocator, 0, &terms, "xorbs", &hash_hex, &v2_locations);
+    defer allocator.free(body);
+    responses[4].body = body;
+    responses[5].body = object.bytes;
+    responses[6].body = body;
+    responses[7].body = object.bytes;
+    try server.start();
+    var client = try xet.http.Client.init(allocator, io, server.origin, "");
+    defer client.deinit();
+
+    const published = try client.upload(allocator, data, .{
+        .compression = .none,
+        .strategy = fixed.strategy(),
+    });
+    try std.testing.expect(xet.hash.eql(published.file_hash, expected_hash));
+    // Canonical boundaries must disagree with the fixed-boundary upload
+    const canonical_chunks = try xet.chunkBuffer(allocator, data);
+    defer allocator.free(canonical_chunks);
+    try std.testing.expect(canonical_chunks.len > 1);
+    const rebuilt_nodes = try allocator.alloc(xet.hash.Node, canonical_chunks.len);
+    defer allocator.free(rebuilt_nodes);
+    for (canonical_chunks, rebuilt_nodes) |chunk, *node| {
+        node.* = .{ .hash = chunk.hash, .size = @intCast(chunk.data.len) };
+    }
+    try std.testing.expect(!xet.hash.eql(try xet.hash.file(allocator, rebuilt_nodes), expected_hash));
+    try std.testing.expectError(error.HashMismatch, client.download(allocator, published.file_hash));
+    const output = try client.downloadWith(allocator, published.file_hash, fixed.strategy());
+    defer allocator.free(output);
+    try std.testing.expectEqualSlices(u8, data, output);
+    try server.finish();
+}
+
 test "simple HTTP download releases output after a hash mismatch" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
