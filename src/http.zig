@@ -288,7 +288,7 @@ pub const Client = struct {
         if (response.head.status != .ok) return statusError(response.head.status);
         const body = try readResponse(self.allocator, &response, 64 * 1024);
         defer self.allocator.free(body);
-        // was_inserted only reports deduplication, not upload success
+        // The body only reports deduplication, so the status is the success signal
     }
 
     pub fn putShard(self: *Client, bytes: []const u8) !void {
@@ -348,7 +348,7 @@ pub const UploadFile = struct {
         self.* = undefined;
     }
 
-    /// Borrows input only for this call; a failed write makes the file terminal
+    /// Borrows input for this call only, and a failed write is terminal
     pub fn write(self: *UploadFile, input: []const u8) !void {
         switch (self.state) {
             .active => {},
@@ -363,7 +363,7 @@ pub const UploadFile = struct {
         };
     }
 
-    /// Adds the file plan to the batch; session.finish publishes the combined shard
+    /// Queues the file plan, so only session.finish publishes the combined shard
     pub fn finish(self: *UploadFile) !storage.PublishResult {
         switch (self.state) {
             .active => {},

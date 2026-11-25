@@ -123,7 +123,6 @@ pub const ConsumeOptions = struct {
     strategy: ?chunker.Strategy = null,
 };
 
-/// Decode prefetched terms in file order
 pub fn consume(
     allocator: std.mem.Allocator,
     io: std.Io,

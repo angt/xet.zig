@@ -366,7 +366,7 @@ pub const BatchPublisher = struct {
         self.* = undefined;
     }
 
-    /// Success empties `plan`; failure preserves its batch-allocator-owned allocations
+    /// Success empties `plan`, while failure leaves its allocations to the batch allocator
     pub fn append(self: *BatchPublisher, plan: *Plan) !void {
         if (self.finished) return error.AlreadyFinished;
         try self.plans.ensureUnusedCapacity(self.allocator, 1);

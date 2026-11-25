@@ -73,7 +73,7 @@ pub const ShardIndex = struct {
         self.* = .{};
     }
 
-    /// Takes ownership of `bytes` even on failure and returns false if expired or oversized
+    /// Takes ownership of `bytes` even on failure, returning false when expired or oversized
     pub fn addOwned(self: *ShardIndex, allocator: std.mem.Allocator, bytes: []u8, now: i64) !bool {
         var owned = true;
         defer if (owned) allocator.free(bytes);

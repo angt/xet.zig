@@ -74,7 +74,7 @@ pub const Scratch = struct {
     table: [1 << 13]u16 = undefined,
 };
 
-/// `dst` must have `input.len` bytes; returns `null` unless compression shrinks
+/// `dst` is `input.len` bytes and the result is null unless compression shrinks
 fn encodeBlock(scratch: *Scratch, input: []const u8, dst: []u8) ?usize {
     std.debug.assert(input.len <= block_size);
     std.debug.assert(dst.len == input.len);
@@ -304,7 +304,6 @@ pub fn compressInto(
     output.appendSliceAssumeCapacity(&trailer);
 }
 
-/// Allocates compression scratch with `allocator`
 pub fn compress(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(allocator);

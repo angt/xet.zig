@@ -110,7 +110,6 @@ pub fn reconstructInto(
     return writer.buffered();
 }
 
-/// Returns an allocated reconstruction of the plan or requested range
 pub fn reconstruct(allocator: std.mem.Allocator, plan: *const Plan, opener: Opener) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
@@ -128,8 +127,7 @@ pub fn consume(
     return consumeWith(allocator, plan, opener, sink, null);
 }
 
-/// A null strategy preserves canonical whole-file verification
-/// Complete file hashes require the same boundaries used during upload
+/// File hashes only match when the strategy matches the one used during upload
 pub fn consumeWith(
     allocator: std.mem.Allocator,
     plan: *const Plan,

@@ -50,7 +50,6 @@ pub fn verificationNodes(nodes: []const Node) Hash {
     return out;
 }
 
-/// Formats four little-endian u64 words as hexadecimal
 pub fn toHex(value: Hash) [64]u8 {
     const hex = "0123456789abcdef";
     var out: [64]u8 = undefined;
