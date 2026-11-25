@@ -123,6 +123,7 @@ pub const ConsumeOptions = struct {
     strategy: ?chunker.Strategy = null,
 };
 
+/// Decode prefetched terms in file order
 pub fn consume(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -138,8 +139,10 @@ pub fn consume(
         for (plan.terms) |term| total += term.unpacked_length;
         break :blk total - plan.offset_into_first_range;
     };
+    var locator = reconstruction.Locator.init(allocator, plan.locations);
+    defer locator.deinit();
     for (plan.terms) |term| {
-        const location = reconstruction.findLocation(plan.locations, term) orelse return error.MissingLocation;
+        const location = try locator.find(term) orelse return error.MissingLocation;
         const byte_range = location.byte_range orelse
             return reconstruction.consumeWith(allocator, plan, opener, sink, opts.strategy);
         const size = try stream.rangeLength(byte_range);
@@ -179,9 +182,10 @@ pub fn consume(
     var current: usize = 0;
     while (current < plan.terms.len and context.written != wanted) {
         while (next - current < opts.window and next < plan.terms.len) {
+            const location = try locator.find(plan.terms[next]) orelse return error.MissingLocation;
             const task = try allocator.create(TermTask);
             errdefer allocator.destroy(task);
-            task.* = .{ .context = &context, .index = next };
+            task.* = .{ .context = &context, .index = next, .location = location };
             tasks[next % opts.window] = task;
             completed[next % opts.window] = false;
             next += 1;
@@ -224,6 +228,7 @@ const Context = struct {
 const TermTask = struct {
     context: *Context,
     index: usize,
+    location: reconstruction.Location,
     data: []u8 = &.{},
     err: ?anyerror = null,
 
@@ -242,8 +247,7 @@ fn fetch(task: *TermTask) ?*TermTask {
 
 fn fetchInner(task: *TermTask) !void {
     const context = task.context;
-    const term = context.plan.terms[task.index];
-    const location = reconstruction.findLocation(context.plan.locations, term) orelse return error.MissingLocation;
+    const location = task.location;
     const source = try context.opener.open(.{
         .hash = location.hash,
         .url = location.url,
@@ -268,7 +272,13 @@ fn decode(task: *TermTask, context: *Context) !u64 {
         .wanted = context.wanted,
         .written = &context.written,
     };
-    return reconstruction.decodeTerm(context.allocator, context.plan, task.index, &source, &output.writer);
+    return reconstruction.decodeLocatedTerm(
+        context.allocator,
+        context.plan.terms[task.index],
+        task.location,
+        &source,
+        &output.writer,
+    );
 }
 
 const TestFetch = struct {
@@ -465,35 +475,110 @@ test "default concurrent reads cover normal xorb sizes without empty writes" {
     try std.testing.expectEqual(@as(usize, 0), counting.empty);
 }
 
-test "concurrent consumption rejects overflowing byte ranges before opening" {
+test "concurrent consumption skips overflowing ranges when a whole object is available" {
+    const allocator = std.testing.allocator;
+    const chunks = [_]xorb.Chunk{
+        .{ .data = "abc", .hash = hashing.data("abc") },
+    };
+    var object = try xorb.serialize(allocator, &chunks, .none);
+    defer object.deinit(allocator);
+    const whole = reconstruction.Location{
+        .hash = object.hash,
+        .range = .{ .start = 0, .end = 1 },
+        .url = "memory://whole",
+        .byte_range = null,
+    };
+    const overflowing = reconstruction.Location{
+        .hash = object.hash,
+        .range = .{ .start = 0, .end = 1 },
+        .url = "memory://overflowing",
+        .byte_range = .{ .start = 0, .end = std.math.maxInt(u64) },
+    };
+    const Reader = struct {
+        bytes: []const u8,
+        opens: usize = 0,
+        reader: std.Io.Reader = undefined,
+        output: std.Io.Writer.Allocating,
+        writer: std.Io.Writer = undefined,
+
+        fn init(bytes: []const u8) @This() {
+            return .{ .bytes = bytes, .output = .init(std.testing.allocator) };
+        }
+        fn open(raw: *anyopaque, request: stream.Request) !*std.Io.Reader {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.opens += 1;
+            try std.testing.expect(request.byte_range == null);
+            try std.testing.expectEqualStrings("memory://whole", request.url);
+            self.reader = .fixed(self.bytes);
+            return &self.reader;
+        }
+        fn close(_: *anyopaque, _: *std.Io.Reader) void {}
+        fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const self: *@This() = @fieldParentPtr("writer", writer);
+            for (data[0 .. data.len - 1]) |part| self.output.writer.writeAll(part) catch
+                return error.WriteFailed;
+            for (0..splat) |_| self.output.writer.writeAll(data[data.len - 1]) catch
+                return error.WriteFailed;
+            return std.Io.Writer.countSplat(data, splat);
+        }
+    };
+    var orders = [_][2]reconstruction.Location{
+        .{ whole, overflowing },
+        .{ overflowing, whole },
+    };
+    for (&orders) |*locations| {
+        var terms = [_]reconstruction.Term{.{
+            .hash = object.hash,
+            .unpacked_length = 3,
+            .range = .{ .start = 0, .end = 1 },
+        }};
+        var plan = reconstruction.Plan{ .terms = &terms, .locations = locations };
+        try plan.validate();
+        var reader = Reader.init(object.bytes);
+        reader.writer = .{ .vtable = &.{ .drain = Reader.drain }, .buffer = &.{} };
+        defer reader.output.deinit();
+        const count = try consume(allocator, std.testing.io, &plan, .{
+            .context = &reader,
+            .open_fn = Reader.open,
+            .close_fn = Reader.close,
+        }, &reader.writer, .{});
+        try std.testing.expectEqual(@as(u64, 3), count);
+        try std.testing.expectEqualStrings("abc", reader.output.written());
+        try std.testing.expectEqual(@as(usize, 1), reader.opens);
+    }
+}
+
+test "concurrent fallback rejects an overflow-only term after a whole-object term" {
     const allocator = std.testing.allocator;
     const hash = hashing.data("object");
-    var terms = [_]reconstruction.Term{.{
-        .hash = hash,
-        .unpacked_length = 1,
-        .range = .{ .start = 0, .end = 1 },
-    }};
-    var locations = [_]reconstruction.Location{.{
-        .hash = hash,
-        .range = .{ .start = 0, .end = 1 },
-        .url = "memory://object",
-        .byte_range = .{ .start = 0, .end = std.math.maxInt(u64) },
-    }};
-    var plan = reconstruction.Plan{
-        .terms = &terms,
-        .locations = &locations,
+    var terms = [_]reconstruction.Term{
+        .{ .hash = hash, .unpacked_length = 1, .range = .{ .start = 0, .end = 1 } },
+        .{ .hash = hash, .unpacked_length = 1, .range = .{ .start = 1, .end = 2 } },
     };
+    var locations = [_]reconstruction.Location{
+        .{
+            .hash = hash,
+            .range = .{ .start = 0, .end = 1 },
+            .url = "memory://whole",
+            .byte_range = null,
+        },
+        .{
+            .hash = hash,
+            .range = .{ .start = 1, .end = 2 },
+            .url = "memory://overflowing",
+            .byte_range = .{ .start = 0, .end = std.math.maxInt(u64) },
+        },
+    };
+    var plan = reconstruction.Plan{ .terms = &terms, .locations = &locations };
     var test_fetch = TestFetch{ .bytes = "" };
     defer test_fetch.output.deinit(allocator);
-    try std.testing.expectError(error.InvalidRange, consume(
-        allocator,
-        std.testing.io,
-        &plan,
-        .{ .context = &test_fetch, .open_fn = TestFetch.open, .close_fn = TestFetch.close },
-        &test_fetch.writer,
-        .{},
-    ));
+    try std.testing.expectError(error.InvalidRange, consume(allocator, std.testing.io, &plan, .{
+        .context = &test_fetch,
+        .open_fn = TestFetch.open,
+        .close_fn = TestFetch.close,
+    }, &test_fetch.writer, .{}));
     try std.testing.expectEqual(@as(usize, 0), test_fetch.opened.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), test_fetch.output.items.len);
 }
 
 test "consumer tracks current and out-of-order completions by task identity" {
@@ -786,6 +871,163 @@ test "concurrent prefetch verifies with the caller chunk strategy" {
     });
     try std.testing.expectEqual(@as(u64, 10), count);
     try std.testing.expectEqualStrings(data, test_fetch.output.items);
+}
+
+/// Serves only the packed range the ranking should pick
+const RangeFetch = struct {
+    allocator: std.mem.Allocator = std.testing.allocator,
+    bytes: []const u8,
+    start: u64,
+    end: u64,
+    opens: std.atomic.Value(usize) = .init(0),
+
+    fn open(raw: *anyopaque, request: stream.Request) !*std.Io.Reader {
+        const self: *RangeFetch = @ptrCast(@alignCast(raw));
+        _ = self.opens.fetchAdd(1, .monotonic);
+        try std.testing.expectEqualStrings("memory://better", request.url);
+        const range = request.byte_range orelse return error.TestMissingRequest;
+        try std.testing.expectEqual(self.start, range.start);
+        try std.testing.expectEqual(self.end, range.end);
+        const reader = try self.allocator.create(std.Io.Reader);
+        reader.* = .fixed(self.bytes[@intCast(range.start)..][0..@intCast(range.end - range.start + 1)]);
+        return reader;
+    }
+
+    fn close(raw: *anyopaque, reader: *std.Io.Reader) void {
+        const self: *RangeFetch = @ptrCast(@alignCast(raw));
+        self.allocator.destroy(reader);
+    }
+};
+
+test "concurrent prefetch decodes through the better location listed last" {
+    const allocator = std.testing.allocator;
+    const chunks = [_]xorb.Chunk{
+        .{ .data = "a", .hash = hashing.data("a") },
+        .{ .data = "b", .hash = hashing.data("b") },
+    };
+    var object = try xorb.serialize(allocator, &chunks, .none);
+    defer object.deinit(allocator);
+    const count = 64;
+    const terms = try allocator.alloc(reconstruction.Term, count);
+    defer allocator.free(terms);
+    for (terms) |*term| term.* = .{
+        .hash = object.hash,
+        .unpacked_length = 1,
+        .range = .{ .start = 1, .end = 2 },
+    };
+    const locations = try allocator.alloc(reconstruction.Location, count);
+    defer allocator.free(locations);
+    for (locations) |*location| location.* = .{
+        .hash = object.hash,
+        .range = .{ .start = 0, .end = 2 },
+        .url = "memory://decoy",
+        .byte_range = .{ .start = 0, .end = @intCast(object.body_length - 1) },
+    };
+    const packed_start: u64 = 8 + chunks[0].data.len;
+    const packed_end = packed_start + 8 + chunks[1].data.len - 1;
+    locations[count - 1] = .{
+        .hash = object.hash,
+        .range = .{ .start = 1, .end = 2 },
+        .url = "memory://better",
+        .byte_range = .{ .start = packed_start, .end = packed_end },
+    };
+    var plan = try reconstruction.Plan.init(allocator, terms, locations);
+    defer plan.deinit(allocator);
+    var context = RangeFetch{
+        .bytes = object.bytes,
+        .start = packed_start,
+        .end = packed_end,
+    };
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const written = try consume(allocator, std.testing.io, &plan, .{
+        .context = &context,
+        .open_fn = RangeFetch.open,
+        .close_fn = RangeFetch.close,
+    }, &output.writer, .{ .window = 1 });
+    try std.testing.expectEqual(@as(u64, count), written);
+    try std.testing.expectEqual(@as(usize, count), context.opens.load(.monotonic));
+    try std.testing.expectEqual(count, output.written().len);
+    for (output.written()) |byte| try std.testing.expectEqual(@as(u8, 'b'), byte);
+}
+
+test "concurrent prefetch decodes cycled ranges through their own location" {
+    const allocator = std.testing.allocator;
+    const cycle = 16;
+    const pattern = "abcdefghijklmnop";
+    var chunks: [cycle]xorb.Chunk = undefined;
+    for (&chunks, 0..) |*chunk, index| {
+        const byte = pattern[index..][0..1];
+        chunk.* = .{ .data = byte, .hash = hashing.data(byte) };
+    }
+    var object = try xorb.serialize(allocator, &chunks, .none);
+    defer object.deinit(allocator);
+    const count = 256;
+    const terms = try allocator.alloc(reconstruction.Term, count);
+    defer allocator.free(terms);
+    for (terms, 0..) |*term, index| {
+        const start: u32 = @intCast(index % cycle);
+        term.* = .{
+            .hash = object.hash,
+            .unpacked_length = 1,
+            .range = .{ .start = start, .end = start + 1 },
+        };
+    }
+    const locations = try allocator.alloc(reconstruction.Location, count);
+    defer allocator.free(locations);
+    for (locations) |*location| location.* = .{
+        .hash = object.hash,
+        .range = .{ .start = 0, .end = cycle },
+        .url = "memory://broad",
+        .byte_range = .{ .start = 0, .end = @intCast(object.body_length - 1) },
+    };
+    for (0..cycle) |index| {
+        const start: u64 = index * 9;
+        locations[count - cycle + index] = .{
+            .hash = object.hash,
+            .range = .{ .start = @intCast(index), .end = @intCast(index + 1) },
+            .url = "memory://tight",
+            .byte_range = .{ .start = start, .end = start + 8 },
+        };
+    }
+    var plan = try reconstruction.Plan.init(allocator, terms, locations);
+    defer plan.deinit(allocator);
+
+    const CycledFetch = struct {
+        bytes: []const u8,
+        allocator: std.mem.Allocator = std.testing.allocator,
+        opens: std.atomic.Value(usize) = .init(0),
+
+        fn open(raw: *anyopaque, request: stream.Request) !*std.Io.Reader {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualStrings("memory://tight", request.url);
+            const range = request.byte_range orelse return error.TestMissingRequest;
+            if (range.end - range.start != 8) return error.TestMissingRequest;
+            if ((range.start % 9) != 0) return error.TestMissingRequest;
+            if (range.start / 9 >= cycle) return error.TestMissingRequest;
+            _ = self.opens.fetchAdd(1, .monotonic);
+            const reader = try self.allocator.create(std.Io.Reader);
+            reader.* = .fixed(self.bytes[@intCast(range.start)..][0..@intCast(range.end - range.start + 1)]);
+            return reader;
+        }
+        fn close(raw: *anyopaque, reader: *std.Io.Reader) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.allocator.destroy(reader);
+        }
+    };
+    var context = CycledFetch{ .bytes = object.bytes };
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const written = try consume(allocator, std.testing.io, &plan, .{
+        .context = &context,
+        .open_fn = CycledFetch.open,
+        .close_fn = CycledFetch.close,
+    }, &output.writer, .{ .window = 4 });
+    try std.testing.expectEqual(@as(u64, count), written);
+    try std.testing.expectEqual(@as(usize, count), context.opens.load(.monotonic));
+    try std.testing.expectEqual(count, output.written().len);
+    for (output.written(), 0..) |byte, index|
+        try std.testing.expectEqual(@as(u8, pattern[index % cycle]), byte);
 }
 
 test "upload errors drain outstanding tasks before finish returns" {

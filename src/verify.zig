@@ -11,10 +11,6 @@ pub const Verifier = struct {
     interface: std.Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
     error_value: ?anyerror = null,
 
-    pub fn init(allocator: std.mem.Allocator, output: ?*std.Io.Writer) Verifier {
-        return initWith(allocator, output, null);
-    }
-
     /// A null strategy verifies the canonical Xet file identity
     pub fn initWith(
         allocator: std.mem.Allocator,
@@ -83,7 +79,7 @@ test "verifier writer preserves allocation failures and releases pending input" 
     const support = @import("test_support");
     var tracker = support.TrackingAllocator{ .backing = std.testing.allocator, .fail_at = 0 };
     defer tracker.deinit();
-    var verifier = Verifier.init(tracker.allocator(), null);
+    var verifier = Verifier.initWith(tracker.allocator(), null, null);
     defer verifier.deinit();
     try std.testing.expectError(error.WriteFailed, verifier.interface.writeAll("pending"));
     try std.testing.expectEqual(error.OutOfMemory, verifier.failure(error.WriteFailed));
@@ -94,7 +90,7 @@ test "verifier writer consumes every splat repetition once" {
     const allocator = std.testing.allocator;
     var bytes: [9]u8 = undefined;
     var output: std.Io.Writer = .fixed(&bytes);
-    var verifier = Verifier.init(allocator, &output);
+    var verifier = Verifier.initWith(allocator, &output, null);
     defer verifier.deinit();
     var parts = [_][]const u8{"abc"};
     try verifier.interface.writeSplatAll(&parts, 3);

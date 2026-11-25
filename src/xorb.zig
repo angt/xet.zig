@@ -18,6 +18,12 @@ pub const Chunk = struct {
     hash: hashing.Hash,
 };
 
+/// Target chunk metadata that a decoded stream must reproduce exactly
+pub const ExpectedChunk = struct {
+    hash: hashing.Hash,
+    size: u32,
+};
+
 pub const Serialized = struct {
     bytes: []u8,
     body_length: usize,
@@ -396,7 +402,22 @@ pub fn decodeStream(
     end: u32,
     sink: *std.Io.Writer,
 ) !u64 {
+    return decodeStreamSized(allocator, source, start, end, null, sink);
+}
+
+/// Expected entries cover only the selected records, in order
+pub fn decodeStreamSized(
+    allocator: std.mem.Allocator,
+    source: *std.Io.Reader,
+    start: u32,
+    end: u32,
+    expected: ?[]const ExpectedChunk,
+    sink: *std.Io.Writer,
+) !u64 {
     if (start >= end) return error.InvalidRange;
+    if (expected) |chunks| {
+        if (chunks.len != end - start) return error.SizeMismatch;
+    }
     var compressed: std.ArrayList(u8) = .empty;
     defer compressed.deinit(allocator);
     var decoded: std.ArrayList(u8) = .empty;
@@ -414,6 +435,9 @@ pub fn decodeStream(
         if (index < start) {
             try discardExact(source, compressed_size);
             continue;
+        }
+        if (expected) |chunks| {
+            if (raw_size != @as(usize, chunks[index - start].size)) return error.SizeMismatch;
         }
 
         const compression = std.enums.fromInt(Compression, header[4]) orelse

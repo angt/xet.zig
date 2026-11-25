@@ -304,6 +304,7 @@ pub fn compressInto(
     output.appendSliceAssumeCapacity(&trailer);
 }
 
+/// Allocates scratch internally. Use `compressInto` to supply scratch
 pub fn compress(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(allocator);
@@ -396,7 +397,6 @@ test "LZ4 validates the content checksum only on decoded output" {
     const encoded = try compress(allocator, "a");
     defer allocator.free(encoded);
 
-    // Drop the content-size field so the size mismatch is only caught after decoding
     const frame = try allocator.alloc(u8, encoded.len - 8);
     defer allocator.free(frame);
     @memcpy(frame[0..6], encoded[0..6]);

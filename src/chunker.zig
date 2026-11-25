@@ -101,19 +101,12 @@ pub const Chunker = struct {
             };
             break :blk input.len;
         };
-        if (self.pending.items.len == 0) {
-            const bytes = input[0..consumed];
-            self.hash = 0;
-            if (self.strategy) |strategy| strategy.reset();
-            return .{
-                .chunk = .{ .data = bytes, .hash = hashing.data(bytes) },
-                .consumed = consumed,
-            };
-        }
-        try self.pending.appendSlice(allocator, input[0..consumed]);
+        const bytes = if (self.pending.items.len == 0) input[0..consumed] else blk: {
+            try self.pending.appendSlice(allocator, input[0..consumed]);
+            self.returned_pending = true;
+            break :blk self.pending.items;
+        };
         self.hash = 0;
-        self.returned_pending = true;
-        const bytes = self.pending.items;
         if (self.strategy) |strategy| strategy.reset();
         return .{
             .chunk = .{ .data = bytes, .hash = hashing.data(bytes) },

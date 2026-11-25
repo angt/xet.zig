@@ -379,15 +379,8 @@ pub const Reader = struct {
             }
             return null;
         }
-        var low: usize = 0;
-        var high = self.footer.file_count;
         const needle = hashing.truncated(hash);
-        while (low < high) {
-            const middle = low + (high - low) / 2;
-            const key = try readU64(self.data, self.footer.file_lookup_offset + 12 * middle);
-            if (key < needle) low = middle + 1 else high = middle;
-        }
-        var index = low;
+        var index = try self.lowerBound(self.footer.file_lookup_offset, self.footer.file_count, 12, needle);
         while (index < self.footer.file_count) : (index += 1) {
             const offset = self.footer.file_lookup_offset + 12 * index;
             if (try readU64(self.data, offset) != needle) break;
@@ -408,15 +401,8 @@ pub const Reader = struct {
             }
             return null;
         }
-        var low: usize = 0;
-        var high = self.footer.xorb_count;
         const needle = hashing.truncated(hash);
-        while (low < high) {
-            const middle = low + (high - low) / 2;
-            const offset = self.footer.xorb_lookup_offset + 12 * middle;
-            if (try readU64(self.data, offset) < needle) low = middle + 1 else high = middle;
-        }
-        var index = low;
+        var index = try self.lowerBound(self.footer.xorb_lookup_offset, self.footer.xorb_count, 12, needle);
         while (index < self.footer.xorb_count) : (index += 1) {
             const offset = self.footer.xorb_lookup_offset + 12 * index;
             if (try readU64(self.data, offset) != needle) break;
@@ -428,15 +414,24 @@ pub const Reader = struct {
     }
 
     pub fn findChunks(self: Reader, hash: hashing.Hash) !ChunkLookup {
+        const index = try self.lowerBound(
+            self.footer.chunk_lookup_offset,
+            self.footer.chunk_count,
+            16,
+            hashing.truncated(hash),
+        );
+        return .{ .reader = self, .hash = hash, .index = index };
+    }
+
+    /// First lookup index whose truncated hash is at least `needle`
+    fn lowerBound(self: Reader, start: usize, count: usize, stride: usize, needle: u64) !usize {
         var low: usize = 0;
-        var high = self.footer.chunk_count;
-        const needle = hashing.truncated(hash);
+        var high = count;
         while (low < high) {
             const middle = low + (high - low) / 2;
-            const offset = self.footer.chunk_lookup_offset + 16 * middle;
-            if (try readU64(self.data, offset) < needle) low = middle + 1 else high = middle;
+            if (try readU64(self.data, start + stride * middle) < needle) low = middle + 1 else high = middle;
         }
-        return .{ .reader = self, .hash = hash, .index = low };
+        return low;
     }
 
     pub fn fileAt(self: Reader, index: u32) !FileInfo {
@@ -546,7 +541,7 @@ pub const OwnedFile = struct {
 
     pub fn deinit(self: *OwnedFile, allocator: std.mem.Allocator) void {
         allocator.free(self.value.segments);
-        if (self.value.verification.len != 0) allocator.free(self.value.verification);
+        allocator.free(self.value.verification);
         self.* = undefined;
     }
 };
@@ -595,7 +590,7 @@ pub const FileInfo = struct {
         errdefer allocator.free(segments);
         for (segments, 0..) |*item, index| item.* = try self.segment(@intCast(index));
         var checks: []const hashing.Hash = &.{};
-        errdefer if (checks.len != 0) allocator.free(checks);
+        errdefer allocator.free(checks);
         if (self.flags & verification_flag != 0) {
             const values = try allocator.alloc(hashing.Hash, self.count);
             checks = values;

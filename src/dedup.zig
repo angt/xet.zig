@@ -73,7 +73,7 @@ pub const ShardIndex = struct {
         self.* = .{};
     }
 
-    /// Takes ownership of `bytes` even on failure, returning false when expired or oversized
+    /// Takes ownership of `bytes` even on failure and returns false if expired or oversized
     pub fn addOwned(self: *ShardIndex, allocator: std.mem.Allocator, bytes: []u8, now: i64) !bool {
         var owned = true;
         defer if (owned) allocator.free(bytes);
@@ -167,12 +167,14 @@ pub const SessionIndex = struct {
         try self.xorbs.ensureUnusedCapacity(self.allocator, 1);
         try self.entries.ensureUnusedCapacity(self.allocator, @intCast(chunks.len));
         self.xorbs.appendAssumeCapacity(.{ .hash = object.hash, .chunks = chunks });
-        for (chunks, 0..) |chunk, index| {
-            self.entries.getOrPutAssumeCapacity(chunk.hash).value_ptr.* = .{
-                .xorb_index = xorb_index,
-                .chunk_index = @intCast(index),
-            };
-        }
+        for (chunks, 0..) |chunk, index| self.addEntry(chunk, xorb_index, @intCast(index));
+    }
+
+    fn addEntry(self: *SessionIndex, chunk: shard.Chunk, xorb_index: usize, chunk_index: u32) void {
+        self.entries.getOrPutAssumeCapacity(chunk.hash).value_ptr.* = .{
+            .xorb_index = xorb_index,
+            .chunk_index = chunk_index,
+        };
     }
 
     pub const Checkpoint = struct {
@@ -197,12 +199,7 @@ pub const SessionIndex = struct {
         }
         self.entries.clearRetainingCapacity();
         for (self.xorbs.items, 0..) |object, xorb_index| {
-            for (object.chunks, 0..) |chunk, chunk_index| {
-                self.entries.getOrPutAssumeCapacity(chunk.hash).value_ptr.* = .{
-                    .xorb_index = xorb_index,
-                    .chunk_index = @intCast(chunk_index),
-                };
-            }
+            for (object.chunks, 0..) |chunk, chunk_index| self.addEntry(chunk, xorb_index, @intCast(chunk_index));
         }
     }
 

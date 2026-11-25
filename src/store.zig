@@ -20,11 +20,11 @@ pub const Object = struct {
     raw_size: u64,
 };
 
-/// Object data is borrowed for each `put` call
 pub const Store = struct {
     context: *anyopaque,
     put_fn: *const fn (context: *anyopaque, object: Object) anyerror!void,
 
+    /// `object.data` is borrowed for this call only
     pub fn put(self: Store, object: Object) !void {
         return self.put_fn(self.context, object);
     }
@@ -48,6 +48,29 @@ pub const NewXorbListener = struct {
     callback: *const fn (context: *anyopaque, object: shard.Xorb) anyerror!void,
 };
 
+pub const ReferenceOperation = struct {
+    xorb_hash: hashing.Hash,
+    chunk_index_start: u32,
+    nodes: []const hashing.Node,
+};
+
+pub const Operation = union(enum) {
+    reference: ReferenceOperation,
+    store: Object,
+};
+
+pub const OperationDisposition = enum { release, retain };
+
+/// A retained store transfers its payload to the listener, which frees it via the publisher allocator
+/// Reference nodes are borrowed and the reference disposition is ignored
+pub const OperationListener = struct {
+    context: *anyopaque,
+    callback: *const fn (
+        context: *anyopaque,
+        operation: Operation,
+    ) anyerror!OperationDisposition,
+};
+
 pub const PublisherOptions = struct {
     compression: xorb.Compression = .lz4,
     max_xorb_size: u64 = constants.max_xorb_size,
@@ -55,6 +78,7 @@ pub const PublisherOptions = struct {
     strategy: ?chunker.Strategy = null,
     dedup_source: ?DedupSource = null,
     new_xorb_listener: ?NewXorbListener = null,
+    operation_listener: ?OperationListener = null,
 
     pub fn fromPack(opts: PackOptions) PublisherOptions {
         return .{
@@ -172,10 +196,7 @@ pub fn pack(
 /// Uploads Xorbs before their shards
 pub fn publish(allocator: std.mem.Allocator, package: *const Package, store: Store) !void {
     for (package.objects, 0..) |object, index| {
-        const duplicate = for (package.objects[0..index]) |previous| {
-            if (hashing.eql(previous.hash, object.hash)) break true;
-        } else false;
-        if (duplicate) continue;
+        if (hasHash(package.objects[0..index], object.hash)) continue;
         try store.put(.{
             .kind = .xorb,
             .hash = object.hash,
@@ -201,14 +222,7 @@ fn publishShardLimited(
     limit: usize,
 ) !void {
     if (limit < empty_shard_size) return error.ShardTooLarge;
-    if (bytes.len <= limit) {
-        return destination.put(.{
-            .kind = .shard,
-            .hash = hashing.data(bytes),
-            .data = bytes,
-            .raw_size = raw_size,
-        });
-    }
+    if (bytes.len <= limit) return putShard(destination, bytes, raw_size);
 
     const reader = try shard.Reader.init(bytes);
     var xorbs: std.ArrayList(shard.Xorb) = .empty;
@@ -222,7 +236,7 @@ fn publishShardLimited(
         const info = try reader.xorbAt(record_index);
         record_index += info.count + 1;
         const addition = (@as(usize, info.count) + 1) * shard.entry_size;
-        if (xorbs.items.len != 0 and addition > limit - size) {
+        if (addition > limit - size) {
             try flushXorbs(allocator, &xorbs, destination);
             size = empty_shard_size;
         }
@@ -245,7 +259,7 @@ fn publishShardLimited(
         const info = try reader.fileAt(file_index);
         file_index = @intCast((info.end - shard.header_size) / shard.entry_size);
         const addition = info.end - info.offset;
-        if (files.items.len != 0 and addition > limit - size) {
+        if (addition > limit - size) {
             try flushFiles(allocator, &files, raw_size, destination, limit);
             size = empty_shard_size;
         }
@@ -263,17 +277,21 @@ pub fn wireShardSize(bytes: []const u8) !usize {
     return reader.footer.file_lookup_offset;
 }
 
+fn putShard(destination: Store, bytes: []const u8, raw_size: u64) !void {
+    return destination.put(.{
+        .kind = .shard,
+        .hash = hashing.data(bytes),
+        .data = bytes,
+        .raw_size = raw_size,
+    });
+}
+
 fn flushXorbs(allocator: std.mem.Allocator, xorbs: *std.ArrayList(shard.Xorb), destination: Store) !void {
     if (xorbs.items.len == 0) return;
     const bytes = try shard.serialize(allocator, &.{}, xorbs.items);
     defer allocator.free(bytes);
     if (try wireShardSize(bytes) > max_shard_size) return error.ShardTooLarge;
-    try destination.put(.{
-        .kind = .shard,
-        .hash = hashing.data(bytes),
-        .data = bytes,
-        .raw_size = 0,
-    });
+    try putShard(destination, bytes, 0);
     for (xorbs.items) |object| allocator.free(object.chunks);
     xorbs.clearRetainingCapacity();
 }
@@ -289,19 +307,19 @@ fn flushFiles(
     const bytes = try shard.serialize(allocator, files.items, &.{});
     defer allocator.free(bytes);
     if (try wireShardSize(bytes) > limit) return error.ShardTooLarge;
-    try destination.put(.{
-        .kind = .shard,
-        .hash = hashing.data(bytes),
-        .data = bytes,
-        .raw_size = raw_size,
-    });
+    try putShard(destination, bytes, raw_size);
     for (files.items) |file| freeDecodedFile(allocator, file);
     files.clearRetainingCapacity();
 }
 
 fn freeDecodedFile(allocator: std.mem.Allocator, file: shard.File) void {
     allocator.free(file.segments);
-    if (file.verification.len != 0) allocator.free(file.verification);
+    allocator.free(file.verification);
+}
+
+fn hasHash(objects: anytype, hash: hashing.Hash) bool {
+    for (objects) |object| if (hashing.eql(object.hash, hash)) return true;
+    return false;
 }
 
 pub const PublishResult = struct {
@@ -366,11 +384,10 @@ pub const BatchPublisher = struct {
         self.* = undefined;
     }
 
-    /// Success empties `plan`, while failure leaves its allocations to the batch allocator
+    /// Success empties `plan`, while failure leaves it owned by the caller
     pub fn append(self: *BatchPublisher, plan: *Plan) !void {
         if (self.finished) return error.AlreadyFinished;
-        try self.plans.ensureUnusedCapacity(self.allocator, 1);
-        self.plans.appendAssumeCapacity(plan.*);
+        try self.plans.append(self.allocator, plan.*);
         plan.* = .{};
     }
 
@@ -493,9 +510,6 @@ pub const Publisher = struct {
         const checks = try self.checks.toOwnedSlice(self.allocator);
         errdefer self.allocator.free(checks);
         const xorbs = try self.xorbs.toOwnedSlice(self.allocator);
-        self.segments = .empty;
-        self.checks = .empty;
-        self.xorbs = .empty;
         return .{
             .file = .{
                 .hash = file_hash,
@@ -531,15 +545,15 @@ pub const Publisher = struct {
         accepted = std.math.add(u64, accepted, byte_total) catch return error.FileTooLarge;
         const continues = self.reuseContinues(object_hash, chunk_index_start);
         const buffered_new = self.serializer.chunks.items.len != 0 or self.chunker.pending.items.len != 0;
-        const uninterrupted = self.pending_len == 0 and !buffered_new;
-        if (continues and uninterrupted) {
-            const last = self.segments.items[self.segments.items.len - 1];
-            if (last.unpacked_segment_bytes > std.math.maxInt(u32) - byte_total) {
-                return error.InvalidDedupMatch;
+        if (self.pending_len == 0) {
+            if (continues and !buffered_new) {
+                const last = self.segments.items[self.segments.items.len - 1];
+                if (last.unpacked_segment_bytes > std.math.maxInt(u32) - byte_total) {
+                    return error.InvalidDedupMatch;
+                }
+            } else {
+                try self.reserveReuseSegments(1 + @as(usize, @intFromBool(buffered_new)));
             }
-        }
-        if (self.pending_len == 0 and (!continues or buffered_new)) {
-            try self.reserveReuseSegments(1 + @as(usize, @intFromBool(buffered_new)));
         }
         self.reuseFallible(object_hash, chunk_index_start, nodes) catch |err| {
             self.failed = true;
@@ -612,6 +626,13 @@ pub const Publisher = struct {
             try self.file_nodes.add(node);
         }
         self.checks.items[last] = self.reuseVerification();
+        if (self.opts.operation_listener) |listener| {
+            _ = try listener.callback(listener.context, .{ .reference = .{
+                .xorb_hash = object_hash,
+                .chunk_index_start = chunk_index_start,
+                .nodes = nodes,
+            } });
+        }
     }
 
     fn reserveReuseSegments(self: *Publisher, count: usize) !void {
@@ -669,6 +690,7 @@ pub const Publisher = struct {
         if (try source.query(self.allocator, hashes[0..self.pending_len])) |found| {
             var match = found;
             defer match.deinit(self.allocator);
+            try self.validatePendingSizes(match.nodes);
             try self.appendReuse(match.xorb_hash, match.chunk_index_start, match.nodes);
             self.dropPending(match.nodes.len);
             return;
@@ -676,6 +698,14 @@ pub const Publisher = struct {
         const first = self.pending_chunks[self.pending_head];
         try self.addNew(first);
         self.dropPending(1);
+    }
+
+    /// Returned sizes must describe the buffered bytes they replace
+    fn validatePendingSizes(self: *const Publisher, nodes: []const hashing.Node) !void {
+        for (nodes, 0..) |node, index| {
+            const chunk = self.pending_chunks[(self.pending_head + index) % dedup_window];
+            if (node.size != chunk.data.len) return error.InvalidDedupMatch;
+        }
     }
 
     fn addNew(self: *Publisher, chunk: chunker.Chunk) !void {
@@ -696,16 +726,15 @@ pub const Publisher = struct {
         var object = try self.serializer.finish(self.allocator);
         defer object.deinit(self.allocator);
         const chunk_count = object.chunks.len;
-        const duplicate = for (self.xorbs.items) |item| {
-            if (hashing.eql(item.hash, object.hash)) break true;
-        } else false;
+        const duplicate = hasHash(self.xorbs.items, object.hash);
         if (!duplicate) {
-            try self.destination.put(.{
+            const event = Object{
                 .kind = .xorb,
                 .hash = object.hash,
                 .data = object.bytes,
                 .raw_size = object.raw_size,
-            });
+            };
+            try self.destination.put(event);
             const metadata = object.chunks;
             object.chunks = &.{};
             self.xorbs.append(self.allocator, .{
@@ -717,8 +746,18 @@ pub const Publisher = struct {
                 self.allocator.free(metadata);
                 return err;
             };
+            if (self.opts.operation_listener) |listener| {
+                const disposition = try listener.callback(listener.context, .{ .store = event });
+                if (disposition == .retain) object.bytes = &.{};
+            }
             if (self.opts.new_xorb_listener) |listener|
                 try listener.callback(listener.context, self.xorbs.items[self.xorbs.items.len - 1]);
+        } else if (self.opts.operation_listener) |listener| {
+            _ = try listener.callback(listener.context, .{ .reference = .{
+                .xorb_hash = object.hash,
+                .chunk_index_start = 0,
+                .nodes = object.nodes,
+            } });
         }
         try self.segments.append(self.allocator, .{
             .xorb_hash = object.hash,

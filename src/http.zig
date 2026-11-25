@@ -66,7 +66,6 @@ pub const Client = struct {
         self.* = undefined;
     }
 
-    /// Whole request bodies successfully flushed, including retries but excluding partial writes
     pub fn uploadedBytes(self: *Client) u64 {
         self.upload_bytes_mutex.lockUncancelable(self.http_client.io);
         defer self.upload_bytes_mutex.unlock(self.http_client.io);
@@ -495,7 +494,7 @@ const GlobalDedup = struct {
 
     fn addXorb(raw: *anyopaque, item: shard.Xorb) !void {
         const self: *GlobalDedup = @ptrCast(@alignCast(raw));
-        try self.index.addXorbTracked(item, if (self.point) |*point| point else null);
+        try self.index.addXorb(item);
     }
 
     fn query(raw: *anyopaque, allocator: std.mem.Allocator, hashes: []const hashing.Hash) !?dedup.Match {
@@ -720,6 +719,16 @@ fn parseRange(parent: std.json.ObjectMap, name: []const u8) !reconstruction.Rang
     return result;
 }
 
+fn parseByteRange(value: std.json.Value) !reconstruction.ByteRange {
+    const parent = try object(value);
+    const result = reconstruction.ByteRange{
+        .start = try integer(u64, parent, "start"),
+        .end = try integer(u64, parent, "end"),
+    };
+    if (result.start > result.end) return error.InvalidResponse;
+    return result;
+}
+
 fn parsePlan(
     allocator: std.mem.Allocator,
     body: []const u8,
@@ -772,32 +781,20 @@ fn parsePlan(
                 const ranges = try array(try field(item, "ranges"));
                 for (ranges.items) |range_value| {
                     const descriptor = try object(range_value);
-                    const byte_object = try object(try field(descriptor, "bytes"));
-                    const byte_range = reconstruction.ByteRange{
-                        .start = try integer(u64, byte_object, "start"),
-                        .end = try integer(u64, byte_object, "end"),
-                    };
-                    if (byte_range.start > byte_range.end) return error.InvalidResponse;
                     plan.locations[index] = .{
                         .hash = hash,
                         .range = try parseRange(descriptor, "chunks"),
                         .url = try allocator.dupe(u8, url),
-                        .byte_range = byte_range,
+                        .byte_range = try parseByteRange(try field(descriptor, "bytes")),
                     };
                     index += 1;
                 }
             } else {
-                const byte_object = try object(try field(item, "url_range"));
-                const byte_range = reconstruction.ByteRange{
-                    .start = try integer(u64, byte_object, "start"),
-                    .end = try integer(u64, byte_object, "end"),
-                };
-                if (byte_range.start > byte_range.end) return error.InvalidResponse;
                 plan.locations[index] = .{
                     .hash = hash,
                     .range = try parseRange(item, "range"),
                     .url = try allocator.dupe(u8, try string(item, "url")),
-                    .byte_range = byte_range,
+                    .byte_range = try parseByteRange(try field(item, "url_range")),
                 };
                 index += 1;
             }
