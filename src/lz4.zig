@@ -87,13 +87,23 @@ fn encodeBlock(scratch: *Scratch, input: []const u8, dst: []u8) ?usize {
     while (pos + match_end_padding <= input.len) {
         const word = std.mem.readInt(u32, input[pos..][0..4], .little);
         const slot: usize = @intCast((word *% 2654435761) >> 19);
-        const prev = scratch.table[slot];
+        var prev: usize = scratch.table[slot];
         scratch.table[slot] = @intCast(pos);
-        const mismatch = prev == std.math.maxInt(u16) or
-            std.mem.readInt(u32, input[prev..][0..4], .little) != word;
-        if (mismatch) {
+        // A repeated byte also matches the immediately preceding byte. Sparse
+        // sampling on a long literal run can otherwise miss the start of that match.
+        if (pos != 0 and word == std.math.rotl(u32, word, 8) and input[pos - 1] == input[pos])
+            prev = pos - 1;
+        if (prev == std.math.maxInt(u16) or std.mem.readInt(
+            u32,
+            input[prev..][0..4],
+            .little,
+        ) != word) {
             pos += 1 + ((pos - search) >> 6);
             continue;
+        }
+        while (pos > anchor and prev != 0 and input[prev - 1] == input[pos - 1]) {
+            pos -= 1;
+            prev -= 1;
         }
 
         const limit = input.len - last_literals;
@@ -257,8 +267,29 @@ pub fn compressInto(
     output: *std.ArrayList(u8),
     scratch: *Scratch,
 ) !void {
+    _ = try appendFrame(allocator, input, output, scratch, false);
+}
+
+/// Leaves the output unchanged when a raw Xorb record would be smaller or equal.
+pub fn compressIfSmaller(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    output: *std.ArrayList(u8),
+    scratch: *Scratch,
+) !bool {
+    return appendFrame(allocator, input, output, scratch, true);
+}
+
+fn appendFrame(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    output: *std.ArrayList(u8),
+    scratch: *Scratch,
+    comptime smaller_only: bool,
+) !bool {
     const frame_start = output.items.len;
     errdefer output.shrinkRetainingCapacity(frame_start);
+    if (smaller_only and input.len <= 27) return false;
     const block_count = (input.len + block_size - 1) / block_size;
     try output.ensureUnusedCapacity(allocator, 15 + input.len + block_count * 4 + 8);
 
@@ -288,6 +319,10 @@ pub fn compressInto(
                 .little,
             );
         } else {
+            if (smaller_only and output.items.len - frame_start + 8 >= input.len) {
+                output.shrinkRetainingCapacity(frame_start);
+                return false;
+            }
             @memcpy(dst, block);
             std.mem.writeInt(
                 u32,
@@ -299,9 +334,14 @@ pub fn compressInto(
         pos += size;
     }
 
+    if (smaller_only and output.items.len - frame_start + 8 >= input.len) {
+        output.shrinkRetainingCapacity(frame_start);
+        return false;
+    }
     var trailer: [8]u8 = @splat(0);
     std.mem.writeInt(u32, trailer[4..8], checksum(input), .little);
     output.appendSliceAssumeCapacity(&trailer);
+    return true;
 }
 
 /// Allocates scratch internally. Use `compressInto` to supply scratch

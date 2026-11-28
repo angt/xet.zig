@@ -185,9 +185,9 @@ pub const Aggregator = struct {
     }
 
     pub fn root(self: *const Aggregator) !Hash {
+        if (self.leaves == 0) return zero;
+        if (self.leaves == 1) return self.levels[0].nodes[0].hash;
         var work = self.*;
-        if (work.leaves == 0) return zero;
-        if (work.leaves == 1) return work.levels[0].nodes[0].hash;
         for (0..max_levels) |i| {
             const level = &work.levels[i];
             if (level.len == 0) continue;

@@ -30,9 +30,17 @@ pub const TrackingAllocator = struct {
 
     pub fn deinit(self: *TrackingAllocator) void {
         for (self.events.items) |event| {
-            if (self.retain_freed or event.live) self.backing.rawFree(event.bytes, event.alignment, 0);
+            if (self.retain_freed or event.live) self.backing.rawFree(
+                event.bytes,
+                event.alignment,
+                0,
+            );
         }
-        if (self.retain_freed) for (self.old_storage.items) |event| self.backing.rawFree(event.bytes, event.alignment, 0);
+        if (self.retain_freed) for (self.old_storage.items) |event| self.backing.rawFree(
+            event.bytes,
+            event.alignment,
+            0,
+        );
         self.events.deinit(self.backing);
         self.event_indices.deinit(self.backing);
         self.old_storage.deinit(self.backing);
@@ -49,16 +57,29 @@ pub const TrackingAllocator = struct {
         if (self.fail_at == self.allocation_count) return null;
         const index = self.allocation_count;
         const bytes = self.backing.rawAlloc(len, alignment, ra) orelse return null;
-        self.events.append(self.backing, .{ .bytes = bytes[0..len], .alignment = alignment }) catch {
+        self.events.append(
+            self.backing,
+            .{ .bytes = bytes[0..len], .alignment = alignment },
+        ) catch {
             self.backing.rawFree(bytes[0..len], alignment, ra);
             return null;
         };
-        self.event_indices.put(self.backing, @intFromPtr(bytes), self.events.items.len - 1) catch return null;
+        self.event_indices.put(
+            self.backing,
+            @intFromPtr(bytes),
+            self.events.items.len - 1,
+        ) catch return null;
         self.allocation_count = index + 1;
         return bytes;
     }
 
-    fn resize(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+    fn resize(
+        raw: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ra: usize,
+    ) bool {
         const self: *TrackingAllocator = @ptrCast(@alignCast(raw));
         const event = self.findLive(memory, alignment) orelse return false;
         if (!self.backing.rawResize(memory, alignment, new_len, ra)) return false;
@@ -66,7 +87,13 @@ pub const TrackingAllocator = struct {
         return true;
     }
 
-    fn remap(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+    fn remap(
+        raw: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ra: usize,
+    ) ?[*]u8 {
         const self: *TrackingAllocator = @ptrCast(@alignCast(raw));
         if (self.fail_at == self.allocation_count) return null;
         const index = self.allocation_count;
@@ -74,7 +101,10 @@ pub const TrackingAllocator = struct {
         const replacement = self.backing.rawAlloc(new_len, alignment, ra) orelse return null;
         @memcpy(replacement[0..@min(memory.len, new_len)], memory[0..@min(memory.len, new_len)]);
         if (self.retain_freed) {
-            self.old_storage.append(self.backing, .{ .bytes = event.bytes, .alignment = alignment }) catch {
+            self.old_storage.append(
+                self.backing,
+                .{ .bytes = event.bytes, .alignment = alignment },
+            ) catch {
                 self.backing.rawFree(replacement[0..new_len], alignment, ra);
                 return null;
             };
@@ -83,7 +113,11 @@ pub const TrackingAllocator = struct {
         }
         event.bytes = replacement[0..new_len];
         const event_index = @intFromPtr(event) - @intFromPtr(self.events.items.ptr);
-        self.event_indices.put(self.backing, @intFromPtr(replacement), event_index / @sizeOf(AllocEvent)) catch return null;
+        self.event_indices.put(
+            self.backing,
+            @intFromPtr(replacement),
+            event_index / @sizeOf(AllocEvent),
+        ) catch return null;
         self.allocation_count = index + 1;
         return replacement;
     }
@@ -124,7 +158,7 @@ pub const TrackingAllocator = struct {
 };
 
 pub const CapturedObject = struct {
-    kind: xet.ObjectKind,
+    kind: xet.store.ObjectKind,
     hash: xet.Hash,
     data: []u8,
     raw_size: u64,
@@ -135,11 +169,11 @@ pub const MemoryStore = struct {
     objects: std.ArrayList(CapturedObject) = .empty,
     fail_on_put: ?usize = null,
     puts: usize = 0,
-    last_attempted_kind: ?xet.ObjectKind = null,
+    last_attempted_kind: ?xet.store.ObjectKind = null,
     allocation_count: ?*const usize = null,
     put_allocation_count: ?usize = null,
 
-    pub fn store(self: *MemoryStore) xet.Store {
+    pub fn store(self: *MemoryStore) xet.store.Store {
         return .{ .context = self, .put_fn = put };
     }
 
@@ -148,7 +182,7 @@ pub const MemoryStore = struct {
         self.objects.deinit(self.allocator);
     }
 
-    pub fn count(self: *const MemoryStore, kind: xet.ObjectKind) usize {
+    pub fn count(self: *const MemoryStore, kind: xet.store.ObjectKind) usize {
         var result: usize = 0;
         for (self.objects.items) |object| result += @intFromBool(object.kind == kind);
         return result;
@@ -181,6 +215,137 @@ pub const HttpResponse = struct {
     content_encoding: ?[]const u8 = null,
 };
 
+/// Zig delivers a cancel request once, so only one read or write observes it
+var cancel_at_read: ?usize = null;
+var reads_seen: usize = 0;
+var bytes_before_cancel: ?usize = null;
+var cancel_at_write: ?usize = null;
+var writes_seen: usize = 0;
+
+fn cancelOneOperation(
+    userdata: ?*anyopaque,
+    operation: std.Io.Operation,
+) std.Io.Cancelable!std.Io.Operation.Result {
+    switch (std.meta.activeTag(operation)) {
+        .net_read => {
+            defer reads_seen += 1;
+            if (cancel_at_read == reads_seen) return error.Canceled;
+            if (bytes_before_cancel) |left| {
+                if (left == 0) {
+                    bytes_before_cancel = null;
+                    return error.Canceled;
+                }
+                var read = operation.net_read;
+                for (read.data) |buf| {
+                    if (buf.len == 0) continue;
+                    var parts = [_][]u8{buf[0..@min(buf.len, left)]};
+                    read.data = &parts;
+                    const result = try std.testing.io.vtable.operate(
+                        userdata,
+                        .{ .net_read = read },
+                    );
+                    if (result.net_read) |got| bytes_before_cancel = left - got.data_len else |_| {}
+                    return result;
+                }
+            }
+        },
+        .net_write => {
+            defer writes_seen += 1;
+            if (cancel_at_write == writes_seen) return error.Canceled;
+        },
+        else => {},
+    }
+    return std.testing.io.vtable.operate(userdata, operation);
+}
+
+const cancel_vtable: std.Io.VTable = cancel: {
+    var vtable = std.testing.io.vtable.*;
+    vtable.operate = cancelOneOperation;
+    break :cancel vtable;
+};
+
+/// Cancels the read numbered `fail_at`; later reads succeed
+pub fn cancelAtRead(fail_at: usize) std.Io {
+    cancel_at_read = fail_at;
+    reads_seen = 0;
+    return .{ .userdata = std.testing.io.userdata, .vtable = &cancel_vtable };
+}
+
+pub fn cancelAfterReadBytes(limit: usize) std.Io {
+    bytes_before_cancel = limit;
+    return .{ .userdata = std.testing.io.userdata, .vtable = &cancel_vtable };
+}
+
+/// Cancels the write numbered `fail_at`; later writes succeed
+pub fn cancelAtWrite(fail_at: usize) std.Io {
+    cancel_at_write = fail_at;
+    writes_seen = 0;
+    return .{ .userdata = std.testing.io.userdata, .vtable = &cancel_vtable };
+}
+
+pub fn stopCanceling() void {
+    cancel_at_read = null;
+    cancel_at_write = null;
+    bytes_before_cancel = null;
+}
+
+/// Holds the next accept until the io is cancelled, so teardown order is observable
+pub const PausedAccept = struct {
+    /// Set while the serve task is parked in the gated accept
+    parked: std.atomic.Value(bool) = .init(false),
+    /// Counts closes that reached a still-parked accept
+    closes_while_serving: std.atomic.Value(usize) = .init(0),
+
+    /// Waits until the serve task is parked in the gated accept
+    pub fn awaitParked(self: *PausedAccept) void {
+        while (!self.parked.load(.acquire)) std.Thread.yield() catch {};
+    }
+};
+
+var paused: ?*PausedAccept = null;
+/// Arms the next accept, since only that call may park
+var pause_pending: bool = false;
+
+fn pausedAccept(
+    userdata: ?*anyopaque,
+    server: std.Io.net.Socket.Handle,
+    options: std.Io.net.Server.AcceptOptions,
+) std.Io.net.Server.AcceptError!std.Io.net.Socket {
+    if (pause_pending) {
+        pause_pending = false;
+        const state = paused.?;
+        // Parked before the reader is released, so its close cannot miss it
+        state.parked.store(true, .release);
+        defer state.parked.store(false, .release);
+        // Cancellation ends this just as it ends a serve task blocked in accept
+        var word: u32 = 0;
+        std.testing.io.vtable.futexWait(std.testing.io.userdata, &word, 0, .none) catch
+            return error.Canceled;
+        return error.Canceled;
+    }
+    return std.testing.io.vtable.netAccept(userdata, server, options);
+}
+
+fn watchedClose(userdata: ?*anyopaque, sockets: []const std.Io.net.Socket) void {
+    // Closing a still-parked accept is the teardown race under test
+    if (paused) |state| {
+        if (state.parked.load(.acquire)) _ = state.closes_while_serving.fetchAdd(1, .acq_rel);
+    }
+    return std.testing.io.vtable.netClose(userdata, sockets);
+}
+
+var paused_vtable: std.Io.VTable = undefined;
+
+/// Gates the next accept on the testing io until it is cancelled
+pub fn pauseAccepts(state: *PausedAccept) std.Io {
+    paused = state;
+    pause_pending = true;
+    paused_vtable = std.testing.io.vtable.*;
+    paused_vtable.netAccept = pausedAccept;
+    paused_vtable.netClose = watchedClose;
+    return .{ .userdata = std.testing.io.userdata, .vtable = &paused_vtable };
+}
+
 pub const HttpExchange = struct {
     target: []u8,
     range: ?[]u8,
@@ -198,11 +363,16 @@ pub const Loopback = struct {
     global_dedup_shard: ?[]const u8 = null,
     stop_after_shard: bool = false,
     lookup_status: ?std.http.Status = null,
+    xorb_status: ?std.http.Status = null,
     exchanges: std.ArrayList(HttpExchange) = .empty,
     exchange_mutex: std.Io.Mutex = .init,
     futures: std.ArrayList(std.Io.Future(void)) = .empty,
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, responses: []const HttpResponse) !Loopback {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        responses: []const HttpResponse,
+    ) !Loopback {
         var address = std.Io.net.IpAddress{ .ip4 = .loopback(0) };
         var server = try address.listen(io, .{});
         errdefer server.deinit(io);
@@ -235,8 +405,9 @@ pub const Loopback = struct {
     }
 
     pub fn deinit(self: *Loopback) void {
-        self.server.deinit(self.io);
+        // Cancelling joins the serve task, so no accept can outlive the socket
         for (self.futures.items) |*future| future.cancel(self.io);
+        self.server.deinit(self.io);
         self.futures.deinit(self.allocator);
         for (self.exchanges.items) |exchange| {
             self.allocator.free(exchange.target);
@@ -255,18 +426,15 @@ pub const Loopback = struct {
     fn serve(self: *Loopback) void {
         if (self.stop_after_shard) {
             while (true) {
-                const target = self.handleOne(.{}) catch return;
-                defer self.allocator.free(target);
-                if (std.mem.endsWith(u8, target, "/shards")) return;
+                const shard = self.handleOne(.{}) catch return;
+                if (shard) return;
             }
         }
-        for (self.responses) |response| {
-            const target = self.handleOne(response) catch return;
-            self.allocator.free(target);
-        }
+        for (self.responses) |response| _ = self.handleOne(response) catch return;
     }
 
-    fn handleOne(self: *Loopback, response: HttpResponse) ![]u8 {
+    /// Reports whether the request was a shard upload
+    fn handleOne(self: *Loopback, response: HttpResponse) !bool {
         var connection = try self.server.accept(self.io);
         defer connection.close(self.io);
         var read_buffer: [16 * 1024]u8 = undefined;
@@ -276,11 +444,17 @@ pub const Loopback = struct {
         var http_server = std.http.Server.init(&reader.interface, &writer.interface);
         var request = try http_server.receiveHead();
         const target = try self.allocator.dupe(u8, request.head.target);
-        errdefer self.allocator.free(target);
         var range: ?[]u8 = null;
-        errdefer if (range) |value| self.allocator.free(value);
         var accept_encoding: ?[]u8 = null;
-        errdefer if (accept_encoding) |value| self.allocator.free(value);
+        var body: ?[]u8 = null;
+        // Cleared once the exchange list owns these, so a failed reply cannot double free
+        var owned = true;
+        defer if (owned) {
+            self.allocator.free(target);
+            if (range) |value| self.allocator.free(value);
+            if (accept_encoding) |value| self.allocator.free(value);
+            if (body) |value| self.allocator.free(value);
+        };
         var iterator = request.iterateHeaders();
         while (iterator.next()) |header| {
             if (std.ascii.eqlIgnoreCase(header.name, "range")) {
@@ -292,19 +466,19 @@ pub const Loopback = struct {
         }
         var body_buffer: [4096]u8 = undefined;
         const body_reader = request.readerExpectNone(&body_buffer);
-        const body = try body_reader.allocRemaining(self.allocator, .limited(96 * 1024 * 1024));
-        errdefer self.allocator.free(body);
+        body = try body_reader.allocRemaining(self.allocator, .limited(96 * 1024 * 1024));
         self.exchange_mutex.lockUncancelable(self.io);
         self.exchanges.append(self.allocator, .{
             .target = target,
             .range = range,
             .accept_encoding = accept_encoding,
-            .body = body,
+            .body = body.?,
         }) catch |err| {
             self.exchange_mutex.unlock(self.io);
             return err;
         };
         self.exchange_mutex.unlock(self.io);
+        owned = false;
         var headers: [2]std.http.Header = undefined;
         var header_count: usize = 0;
         if (response.content_range) |value| {
@@ -318,7 +492,11 @@ pub const Loopback = struct {
         var actual_response = response;
         if (self.lookup_status != null and std.mem.startsWith(u8, target, "/v1/chunks/")) {
             actual_response.status = self.lookup_status.?;
-        } else if (self.global_dedup_shard != null and std.mem.startsWith(u8, target, "/v1/chunks/")) {
+        } else if (self.global_dedup_shard != null and std.mem.startsWith(
+            u8,
+            target,
+            "/v1/chunks/",
+        )) {
             actual_response.body = self.global_dedup_shard.?;
         } else if (self.stop_after_shard and std.mem.startsWith(u8, target, "/v1/chunks/")) {
             actual_response.status = .not_found;
@@ -327,12 +505,15 @@ pub const Loopback = struct {
                 \\{"type":"result"}
             ;
         }
+        if (self.xorb_status) |status| {
+            if (std.mem.startsWith(u8, target, "/v1/xorbs/")) actual_response.status = status;
+        }
         try request.respond(actual_response.body, .{
             .status = actual_response.status,
             .keep_alive = false,
             .extra_headers = headers[0..header_count],
         });
-        return self.allocator.dupe(u8, target);
+        return std.mem.endsWith(u8, target, "/shards");
     }
 };
 
@@ -359,8 +540,14 @@ pub fn readUncompressedXorb(allocator: std.mem.Allocator, bytes: []const u8) ![]
         const start = position;
         const header = bytes[position..][0..8];
         if (header[0] != 0) return error.TestInvalidXorb;
-        const compressed_size = @as(usize, header[1]) | @as(usize, header[2]) << 8 | @as(usize, header[3]) << 16;
-        const raw_size = @as(usize, header[5]) | @as(usize, header[6]) << 8 | @as(usize, header[7]) << 16;
+        const compressed_size = @as(
+            usize,
+            header[1],
+        ) | @as(usize, header[2]) << 8 | @as(usize, header[3]) << 16;
+        const raw_size = @as(
+            usize,
+            header[5],
+        ) | @as(usize, header[6]) << 8 | @as(usize, header[7]) << 16;
         position += 8;
         if (header[4] != 0 or compressed_size != raw_size or position + raw_size > footer_start)
             return error.TestInvalidXorb;
@@ -434,5 +621,23 @@ pub fn checkShardBody(shard_bytes: []const u8) !void {
     try std.testing.expectEqual(cas_end + cas_bookend.len, shard_bytes.len);
     if (cas_end < 96) return error.TestTruncatedCasSection;
     const xorb_record = cas_end - 96;
-    try std.testing.expectEqual(@as(u32, 11), std.mem.readInt(u32, shard_bytes[xorb_record + 44 ..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 11), std.mem.readInt(
+        u32,
+        shard_bytes[xorb_record + 44 ..][0..4],
+        .little,
+    ));
+}
+
+pub fn uploadBytes(
+    client: *xet.Client,
+    bytes: []const u8,
+    options: xet.store.PackOptions,
+) !xet.store.PublishResult {
+    var source: std.Io.Reader = .fixed(bytes);
+    return client.upload(&source, options);
+}
+
+pub fn addBytes(session: *xet.Client.Session, bytes: []const u8) !void {
+    var source: std.Io.Reader = .fixed(bytes);
+    return session.addFile(&source);
 }

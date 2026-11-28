@@ -1,6 +1,12 @@
-//! File-scoped incremental upload operations
+//! Session-scoped packing and incremental file input
+//!
+//! One Xorb can span completed files. Calling `close` seals the input
+//! stream. The last Xorb is then queued like every full one, so callers see all
+//! Xorb storage through `next`.
 
 const std = @import("std");
+const module = @This();
+const builtin = @import("builtin");
 const dedup = @import("dedup.zig");
 const hashing = @import("hash.zig");
 const shard = @import("shard.zig");
@@ -10,66 +16,88 @@ pub const FileId = usize;
 
 pub const Options = struct {
     dedup_source: ?dedup.Source = null,
+    /// Enables parallel hashing of large canonical writes.
+    io: ?std.Io = null,
 };
 
-pub const Reference = struct {
-    file_id: FileId,
-    value: storage.ReferenceOperation,
+const Work = union(enum) {
+    store: storage.Object,
+    reference: struct {
+        file_id: FileId,
+        xorb_hash: hashing.Hash,
+        chunk_index_start: u32,
+        nodes: []const hashing.Node,
+    },
+
+    fn deinit(self: Work, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .store => |object| allocator.free(object.data),
+            .reference => |ref| allocator.free(ref.nodes),
+        }
+    }
+};
+
+/// Owns the payload and borrows its session. Complete or deinitialize exactly once.
+pub const Operation = struct {
+    work: Work,
     session: *Session,
-    allocator: std.mem.Allocator,
-};
 
-/// Owns `value.data` until the operation completes or is cancelled
-pub const Store = struct {
-    file_id: FileId,
-    value: storage.Object,
-    session: *Session,
-    allocator: std.mem.Allocator,
-};
-
-pub const Operation = union(enum) {
-    reference: Reference,
-    store: Store,
-
-    /// Acknowledges successful execution and releases the owned operation
     pub fn complete(self: *Operation) void {
         self.release(false);
     }
 
-    /// Cancels the operation and prevents session metadata publication
+    /// Cancelling an issued operation prevents publication.
     pub fn deinit(self: *Operation) void {
         self.release(true);
     }
 
     fn release(self: *Operation, failed: bool) void {
-        const session = switch (self.*) {
-            .reference => |value| value.session,
-            .store => |value| value.session,
-        };
-        freePayload(self.*);
-        session.completeOperation(failed);
+        self.work.deinit(self.session.allocator);
+        self.session.completeOperation(failed);
         self.* = undefined;
     }
 };
 
 const QueueNode = struct {
-    gen: u64,
-    operation: Operation,
+    gen: ?u64,
+    work: Work,
 };
+
+/// Interleaves a completion between the two publication checks in a test
+const test_hook = if (builtin.is_test) struct {
+    const Hook = struct {
+        context: *anyopaque,
+        callback: *const fn (context: *anyopaque) void,
+    };
+
+    var finish: ?Hook = null;
+} else struct {};
 
 /// Planning and `next` are single-threaded; worker-thread completions free payloads on the allocator
 pub const Session = struct {
+    pub const File = module.File;
+    pub const Operation = module.Operation;
+    pub const Options = module.Options;
+    pub const FileOptions = storage.PackOptions;
+    pub const Result = storage.PublishResult;
+    pub const Source = dedup.Source;
+    pub const Match = dedup.Match;
+
     allocator: std.mem.Allocator,
     external_source: ?dedup.Source,
     index: dedup.SessionIndex,
-    batch: storage.BatchPublisher,
-    queue: std.ArrayList(*QueueNode) = .empty,
+    packing: storage.Packing,
+    io: ?std.Io,
+    queue: std.ArrayList(QueueNode) = .empty,
     queue_head: usize = 0,
     /// Bookkeeping only, so they do not make the allocator thread-safe
     in_flight: std.atomic.Value(usize) = .init(0),
     operation_failed: std.atomic.Value(bool) = .init(false),
+    /// Set by a successful `close`, after which no file can begin
+    closed: bool = false,
     active: ?u64 = null,
     next_id: u64 = 0,
+
     point_gen: ?u64 = null,
     point: ?dedup.SessionIndex.Checkpoint = null,
 
@@ -77,13 +105,14 @@ pub const Session = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         destination: storage.Store,
-        opts: Options,
+        opts: module.Options,
     ) Session {
         return .{
             .allocator = allocator,
             .external_source = opts.dedup_source,
             .index = .init(allocator),
-            .batch = .init(allocator, destination),
+            .packing = .init(allocator, storage.noStore(), destination, .lz4),
+            .io = opts.io,
         };
     }
 
@@ -92,11 +121,10 @@ pub const Session = struct {
         std.debug.assert(self.active == null);
         std.debug.assert(self.in_flight.load(.acquire) == 0);
         for (self.queue.items[self.queue_head..]) |node| {
-            freePayload(node.operation);
-            self.allocator.destroy(node);
+            node.work.deinit(self.allocator);
         }
         self.queue.deinit(self.allocator);
-        self.batch.deinit();
+        self.packing.deinit();
         self.index.deinit();
         self.* = undefined;
     }
@@ -104,12 +132,15 @@ pub const Session = struct {
     /// The file must remain at its initialized address until deinit
     pub fn beginFile(
         self: *Session,
-        file: *File,
+        file: *module.File,
         file_id: FileId,
         opts: storage.PackOptions,
     ) !void {
-        if (self.batch.finished) return error.AlreadyFinished;
-        if (self.operation_failed.load(.acquire)) return error.OperationFailed;
+        if (self.packing.batch.finished) return error.AlreadyFinished;
+        if (self.closed) return error.InputClosed;
+        if (self.operation_failed.load(
+            .acquire,
+        ) or self.packing.writer.lost) return error.OperationFailed;
         if (self.active != null) return error.ActiveFile;
         const id = self.next_id;
         self.next_id +%= 1;
@@ -118,6 +149,9 @@ pub const Session = struct {
         self.point = self.index.checkpoint();
         var pub_opts = storage.PublisherOptions.fromPack(opts);
         pub_opts.dedup_source = self.source();
+        pub_opts.io = self.io;
+        // A writer listener cannot outlive the session's address, so install it here
+        self.packing.writer.new_xorb_listener = .{ .context = self, .callback = addXorb };
         file.init(self, id, file_id, pub_opts) catch |err| {
             self.rollback(id);
             return err;
@@ -129,8 +163,8 @@ pub const Session = struct {
         file_id: FileId,
         input: []const u8,
         opts: storage.PackOptions,
-    ) !void {
-        var file: File = undefined;
+    ) !storage.PublishResult {
+        var file: module.File = undefined;
         try self.beginFile(&file, file_id, opts);
         defer file.deinit();
         try file.write(input);
@@ -138,38 +172,69 @@ pub const Session = struct {
     }
 
     /// Transfers one owned operation to the caller for immediate or async execution
-    pub fn next(self: *Session) !?Operation {
+    pub fn next(self: *Session) ?module.Operation {
         if (self.queue_head == self.queue.items.len) return null;
         const node = self.queue.items[self.queue_head];
         self.queue_head += 1;
         _ = self.in_flight.fetchAdd(1, .acq_rel);
-        const operation = node.operation;
-        self.allocator.destroy(node);
         self.compact();
-        return operation;
+        return .{ .work = node.work, .session = self };
     }
 
-    /// Requires every emitted operation to complete successfully before publication
+    /// Ends input permanently, queuing the last Xorb only before any failure
+    pub fn close(self: *Session) !void {
+        if (self.closed) return;
+        if (self.active != null) return error.ActiveFile;
+        if (self.operation_failed.load(
+            .acquire,
+        ) or self.packing.writer.lost) return error.OperationFailed;
+        if (self.packing.writer.count() == 0) {
+            self.closed = true;
+            return;
+        }
+        _ = self.packing.writer.installOperationListener(.{
+            .context = self,
+            .callback = enqueueFinal,
+        });
+        try self.packing.seal();
+        self.closed = true;
+    }
+
+    /// Publication needs every issued operation drained and no Xorb left open
     pub fn finish(self: *Session) !void {
         if (self.active != null) return error.ActiveFile;
+        if (self.operation_failed.load(
+            .acquire,
+        ) or self.packing.writer.lost) return error.OperationFailed;
+        if (builtin.is_test) {
+            // One-shot, so a retry never reuses a released operation
+            if (test_hook.finish) |hook| {
+                test_hook.finish = null;
+                hook.callback(hook.context);
+            }
+        }
         if (self.pending() != 0) return error.PendingOperations;
-        if (self.operation_failed.load(.acquire)) return error.OperationFailed;
-        return self.batch.finish();
+        // A worker can record failure while the drain above observed zero
+        if (self.operation_failed.load(
+            .acquire,
+        ) or self.packing.writer.lost) return error.OperationFailed;
+        if (!self.closed) return error.InputOpen;
+        return self.packing.publish();
     }
 
     pub fn pending(self: *const Session) usize {
         return self.queue.items.len - self.queue_head + self.in_flight.load(.acquire);
     }
 
-    pub fn plans(self: *const Session) []const storage.Plan {
-        return self.batch.plans.items;
-    }
-
     fn source(self: *Session) dedup.Source {
         return .{ .context = self, .query_fn = query };
     }
 
-    fn query(raw: *anyopaque, allocator: std.mem.Allocator, hashes: []const hashing.Hash) !?dedup.Match {
+    fn query(
+        raw: *anyopaque,
+        allocator: std.mem.Allocator,
+        hashes: []const hashing.Hash,
+    ) !?dedup.Match {
         const self: *Session = @ptrCast(@alignCast(raw));
         if (try self.index.source().query(allocator, hashes)) |found| return found;
         if (self.external_source) |external| return external.query(allocator, hashes);
@@ -177,36 +242,36 @@ pub const Session = struct {
     }
 
     fn enqueue(raw: *anyopaque, operation: storage.Operation) !storage.OperationDisposition {
-        const self: *File = @ptrCast(@alignCast(raw));
-        const session = self.session;
-        const node = try session.allocator.create(QueueNode);
-        errdefer session.allocator.destroy(node);
-        switch (operation) {
-            .reference => |value| {
-                const nodes = try session.allocator.dupe(hashing.Node, value.nodes);
-                errdefer session.allocator.free(nodes);
-                node.* = .{ .gen = self.id, .operation = .{ .reference = .{
-                    .file_id = self.file_id,
-                    .value = .{
-                        .xorb_hash = value.xorb_hash,
-                        .chunk_index_start = value.chunk_index_start,
-                        .nodes = nodes,
-                    },
-                    .session = session,
-                    .allocator = session.allocator,
-                } } };
-            },
-            .store => |value| node.* = .{ .gen = self.id, .operation = .{ .store = .{
-                .file_id = self.file_id,
-                .value = value,
-                .session = session,
-                .allocator = session.allocator,
-            } } },
-        }
-        session.queue.append(session.allocator, node) catch |err| {
-            if (operation == .reference) freePayload(node.operation);
-            return err;
+        const self: *module.File = @ptrCast(@alignCast(raw));
+        return self.session.push(self.id, self.file_id, operation);
+    }
+
+    /// The final Xorb belongs to the session, even if its chunks span files.
+    fn enqueueFinal(raw: *anyopaque, operation: storage.Operation) !storage.OperationDisposition {
+        const self: *Session = @ptrCast(@alignCast(raw));
+        if (operation == .reference) return .release;
+        return self.push(null, null, operation);
+    }
+
+    fn push(
+        self: *Session,
+        gen: ?u64,
+        file_id: ?FileId,
+        operation: storage.Operation,
+    ) !storage.OperationDisposition {
+        try self.queue.ensureUnusedCapacity(self.allocator, 1);
+        const work: Work = switch (operation) {
+            .store => |owned| .{ .store = owned.item },
+            .reference => |ref| .{ .reference = .{
+                .file_id = file_id orelse return error.MissingFile,
+                .xorb_hash = ref.xorb_hash,
+                .chunk_index_start = ref.chunk_index_start,
+                .nodes = try self.allocator.dupe(hashing.Node, ref.nodes),
+            } },
         };
+        // A queued object holding earlier files survives the active file's rollback.
+        const owner = if (work == .store and self.packing.writer.carries_committed) null else gen;
+        self.queue.appendAssumeCapacity(.{ .gen = owner, .work = work });
         return if (operation == .store) .retain else .release;
     }
 
@@ -218,14 +283,9 @@ pub const Session = struct {
             return;
         }
         if (self.queue_head < 4 or self.queue_head < self.queue.items.len - self.queue_head) return;
-        std.mem.copyForwards(*QueueNode, self.queue.items, self.queue.items[self.queue_head..]);
+        std.mem.copyForwards(QueueNode, self.queue.items, self.queue.items[self.queue_head..]);
         self.queue.shrinkRetainingCapacity(self.queue.items.len - self.queue_head);
         self.queue_head = 0;
-    }
-
-    fn releaseFile(self: *Session, id: u64) void {
-        if (self.active != id) return;
-        self.active = null;
     }
 
     /// Discards unissued work for one generation while issued operations stay owned by callers
@@ -233,13 +293,13 @@ pub const Session = struct {
         if (self.active == id) self.active = null;
         if (self.point_gen == id) {
             self.point_gen = null;
+            self.packing.writer.new_xorb_listener = .{ .context = self, .callback = addXorb };
             self.index.rollback(&self.point);
         }
         var keep = self.queue_head;
         for (self.queue.items[self.queue_head..]) |node| {
             if (node.gen == id) {
-                freePayload(node.operation);
-                self.allocator.destroy(node);
+                node.work.deinit(self.allocator);
             } else {
                 self.queue.items[keep] = node;
                 keep += 1;
@@ -250,6 +310,11 @@ pub const Session = struct {
             self.queue.clearAndFree(self.allocator);
             self.queue_head = 0;
         }
+    }
+
+    fn addXorb(raw: *anyopaque, object: shard.Xorb) !void {
+        const self: *Session = @ptrCast(@alignCast(raw));
+        try self.index.addXorb(object);
     }
 
     fn commit(self: *Session) void {
@@ -270,6 +335,9 @@ pub const File = struct {
     id: u64,
     file_id: FileId,
     publisher: storage.Publisher,
+    /// Unbuffered standard writer. On WriteFailed, err retains the underlying error.
+    interface: std.Io.Writer,
+    err: ?anyerror,
     state: enum { active, finished, failed } = .active,
 
     fn init(
@@ -283,14 +351,22 @@ pub const File = struct {
         self.id = id;
         self.file_id = file_id;
         self.state = .active;
+        self.interface = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} };
+        self.err = null;
         var file_opts = opts;
         file_opts.operation_listener = .{ .context = self, .callback = Session.enqueue };
-        file_opts.new_xorb_listener = .{ .context = self, .callback = newXorb };
-        self.publisher = try storage.Publisher.init(session.allocator, noStore(), file_opts);
+        self.publisher = try session.packing.begin(
+            file_opts,
+            .{ .context = session, .callback = Session.enqueueFinal },
+        );
     }
 
     pub fn deinit(self: *File) void {
-        if (self.session.active == self.id and self.state != .finished) self.session.rollback(self.id);
+        if (self.session.active == self.id and self.state != .finished) {
+            // The writer drops this file's chunks, which only its owner may do
+            self.publisher.abort();
+            self.session.rollback(self.id);
+        }
         self.publisher.deinit();
         self.* = undefined;
     }
@@ -300,43 +376,67 @@ pub const File = struct {
         if (self.state == .finished) return error.AlreadyFinished;
         self.publisher.write(input) catch |err| {
             self.state = .failed;
+            self.publisher.abort();
             self.session.rollback(self.id);
             return err;
         };
     }
 
-    pub fn finish(self: *File) !void {
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *File = @alignCast(@fieldParentPtr("interface", w));
+        for (data[0 .. data.len - 1]) |part| self.write(part) catch |err| {
+            self.err = err;
+            return error.WriteFailed;
+        };
+        for (0..splat) |_| self.write(data[data.len - 1]) catch |err| {
+            self.err = err;
+            return error.WriteFailed;
+        };
+        return std.Io.Writer.countSplat(data, splat);
+    }
+
+    pub fn finish(self: *File) !storage.PublishResult {
         if (self.state == .failed) return error.WriteFailed;
         if (self.state == .finished) return error.AlreadyFinished;
         self.state = .finished;
         errdefer self.state = .failed;
         const session = self.session;
         errdefer session.rollback(self.id);
-        var plan = try self.publisher.finishPlan();
-        errdefer plan.deinit(session.allocator);
-        try session.batch.append(&plan);
+        // Plan failure drops the abandoned chunks with the Xorbs only it filled
+        errdefer self.publisher.abort();
+        const result = try session.packing.endFile(&self.publisher);
         session.commit();
         // Dedup callbacks may re-enter the session, so release the guard last
-        session.releaseFile(self.id);
-    }
-
-    fn newXorb(raw: *anyopaque, object: shard.Xorb) !void {
-        const self: *File = @ptrCast(@alignCast(raw));
-        return self.session.index.addXorb(object);
+        if (session.active == self.id) session.active = null;
+        return result;
     }
 };
 
-fn freePayload(operation: Operation) void {
-    switch (operation) {
-        .reference => |value| value.allocator.free(value.value.nodes),
-        .store => |value| value.allocator.free(value.value.data),
-    }
-}
+test "finish refuses to publish when a worker fails while it drains" {
+    const support = @import("test_support");
+    const allocator = std.testing.allocator;
+    const Hook = struct {
+        operation: *Operation,
+        fired: bool = false,
 
-fn noStore() storage.Store {
-    return .{ .context = undefined, .put_fn = discard };
-}
+        fn cancel(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.operation.deinit();
+            self.fired = true;
+        }
+    };
+    var destination = support.MemoryStore{ .allocator = allocator };
+    defer destination.deinit();
+    var session = Session.init(allocator, destination.store(), .{});
+    defer session.deinit();
+    // A one-chunk limit closes the Xorb, leaving only its store operation queued
+    _ = try session.addFile(1, "alpha", .{ .compression = .none, .max_xorb_chunks = 1 });
+    var operation = session.next().?;
+    var hook = Hook{ .operation = &operation };
+    test_hook.finish = .{ .context = &hook, .callback = Hook.cancel };
+    defer test_hook.finish = null;
 
-fn discard(_: *anyopaque, object: storage.Object) !void {
-    if (object.kind == .shard) return error.InvalidOperation;
+    try std.testing.expectError(error.OperationFailed, session.finish());
+    try std.testing.expect(hook.fired);
+    try std.testing.expectEqual(@as(usize, 0), destination.count(.shard));
 }

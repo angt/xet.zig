@@ -1,9 +1,10 @@
 //! Source-independent chunk reuse and fetch planning
 
+const module = @This();
 const std = @import("std");
 const constants = @import("constants.zig");
 const hashing = @import("hash.zig");
-const reconstruction = @import("reconstruction.zig");
+const recon = @import("recon.zig");
 
 pub const TargetChunk = struct {
     index: usize,
@@ -36,16 +37,33 @@ pub const Base = struct {
 pub const Copy = struct {
     target: TargetChunk,
     source: BaseMatch,
+
+    pub fn write(self: Copy, bytes: []const u8, sink: *std.Io.Writer) !void {
+        if (bytes.len != self.target.size) return error.SizeMismatch;
+        if (!hashing.eql(hashing.data(bytes), self.target.hash)) return error.HashMismatch;
+        try sink.writeAll(bytes);
+    }
 };
 
 pub const Fetch = struct {
     offset: u64,
-    expected_chunks: []const reconstruction.ExpectedChunk,
-    terms: [1]reconstruction.Term,
-    locations: [1]reconstruction.Location,
+    expected_chunks: []const recon.ExpectedChunk,
+    terms: [1]recon.Term,
+    locations: [1]recon.Location,
+
+    /// Decode this operation and verify each chunk against the cursor's expected hashes.
+    pub fn write(
+        self: *Fetch,
+        allocator: std.mem.Allocator,
+        opener: recon.Opener,
+        sink: *std.Io.Writer,
+    ) !u64 {
+        const target = self.plan();
+        return recon.consumeVerified(allocator, &target, opener, self.expected_chunks, sink);
+    }
 
     /// The returned plan borrows this Fetch and its target metadata
-    pub fn plan(self: *Fetch) reconstruction.Plan {
+    pub fn plan(self: *Fetch) recon.Plan {
         return .{
             .terms = &self.terms,
             .locations = &self.locations,
@@ -80,38 +98,50 @@ pub const Program = struct {
 
 /// Produces owned operations without collecting the complete plan
 pub const Cursor = struct {
-    target: *const reconstruction.Plan,
-    expected_chunks: []const reconstruction.ExpectedChunk,
-    base: ?Base,
+    pub const Operation = module.Operation;
+    pub const Base = module.Base;
+    pub const BaseMatch = module.BaseMatch;
+    pub const TargetChunk = module.TargetChunk;
+    pub const Plan = recon.Plan;
+    pub const ExpectedChunk = recon.ExpectedChunk;
+    pub const Term = recon.Term;
+    pub const Location = recon.Location;
+    pub const Opener = recon.Opener;
+    pub const Request = recon.Request;
+    pub const fromShard = recon.planFromShard;
+
+    target: *const recon.Plan,
+    expected_chunks: []const recon.ExpectedChunk,
+    base: ?module.Base,
     size: u64,
     next_chunk: usize = 0,
     file_offset: u64 = 0,
     term_index: usize = 0,
     term_first_chunk: usize = 0,
     lookahead: ?Lookahead = null,
-    locator: reconstruction.Locator,
+    locator: recon.Locator,
 
     const Lookahead = struct {
-        chunk: TargetChunk,
-        match: ?BaseMatch,
+        chunk: module.TargetChunk,
+        match: ?module.BaseMatch,
     };
 
     /// Target metadata must outlive the cursor and every operation it produces
+    /// A location is needed only when next emits a fetch
     pub fn init(
         allocator: std.mem.Allocator,
-        target: *const reconstruction.Plan,
-        expected_chunks: []const reconstruction.ExpectedChunk,
-        base: ?Base,
+        target: *const recon.Plan,
+        expected_chunks: []const recon.ExpectedChunk,
+        base: ?module.Base,
     ) !Cursor {
         if (target.offset_into_first_range != 0 or target.output_length != null)
             return error.UnsupportedRange;
-        try target.validate();
         return .{
             .target = target,
             .expected_chunks = expected_chunks,
             .base = base,
             .size = try validateTarget(target, expected_chunks),
-            .locator = reconstruction.Locator.init(allocator, target.locations),
+            .locator = recon.Locator.init(allocator, target.locations),
         };
     }
 
@@ -122,11 +152,14 @@ pub const Cursor = struct {
     }
 
     /// Copy handles are independently owned; matcher errors leave the position retryable
-    pub fn next(self: *Cursor) !?Operation {
+    pub fn next(self: *Cursor) !?module.Operation {
         if (self.lookahead == null) {
             if (self.next_chunk == self.expected_chunks.len) return null;
             const match = try self.matchAt(self.next_chunk, self.file_offset);
-            self.lookahead = .{ .chunk = self.chunkAt(self.next_chunk, self.file_offset), .match = match };
+            self.lookahead = .{
+                .chunk = self.chunkAt(self.next_chunk, self.file_offset),
+                .match = match,
+            };
         }
         const found = self.lookahead.?;
         if (found.match) |match| {
@@ -137,7 +170,10 @@ pub const Cursor = struct {
 
         const first = self.next_chunk;
         const first_term = self.termAt(first);
-        const start_range = first_term.term.range.start + @as(u32, @intCast(first - first_term.first_chunk));
+        const start_range = first_term.term.range.start + @as(
+            u32,
+            @intCast(first - first_term.first_chunk),
+        );
         var end = first;
         var offset = self.file_offset;
         var size: u64 = 0;
@@ -154,7 +190,7 @@ pub const Cursor = struct {
                 break;
             }
         }
-        const term = reconstruction.Term{
+        const term = recon.Term{
             .hash = first_term.term.hash,
             .unpacked_length = @intCast(size),
             .range = .{
@@ -175,7 +211,7 @@ pub const Cursor = struct {
     }
 
     const TermAt = struct {
-        term: reconstruction.Term,
+        term: recon.Term,
         first_chunk: usize,
         count: usize,
     };
@@ -192,12 +228,12 @@ pub const Cursor = struct {
         unreachable;
     }
 
-    fn chunkAt(self: *const Cursor, index: usize, offset: u64) TargetChunk {
+    fn chunkAt(self: *const Cursor, index: usize, offset: u64) module.TargetChunk {
         const expected = self.expected_chunks[index];
         return .{ .index = index, .offset = offset, .hash = expected.hash, .size = expected.size };
     }
 
-    fn matchAt(self: *const Cursor, index: usize, offset: u64) !?BaseMatch {
+    fn matchAt(self: *const Cursor, index: usize, offset: u64) !?module.BaseMatch {
         const base = self.base orelse return null;
         return base.match(self.chunkAt(index, offset));
     }
@@ -216,8 +252,8 @@ pub const Cursor = struct {
 /// Matches are whole chunks; consecutive missing chunks become one Fetch per term
 pub fn plan(
     allocator: std.mem.Allocator,
-    target: *const reconstruction.Plan,
-    expected_chunks: []const reconstruction.ExpectedChunk,
+    target: *const recon.Plan,
+    expected_chunks: []const recon.ExpectedChunk,
     base: ?Base,
 ) !Program {
     var cursor = try Cursor.init(allocator, target, expected_chunks, base);
@@ -236,8 +272,8 @@ pub fn plan(
 }
 
 pub fn validateTarget(
-    target: *const reconstruction.Plan,
-    expected_chunks: []const reconstruction.ExpectedChunk,
+    target: *const recon.Plan,
+    expected_chunks: []const recon.ExpectedChunk,
 ) !u64 {
     var nodes: hashing.Aggregator = .{};
     var next: usize = 0;

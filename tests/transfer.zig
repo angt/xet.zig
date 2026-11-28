@@ -25,7 +25,7 @@ const StoreOpener = struct {
 };
 
 fn discardUpload(session: *xet.upload.Session) !void {
-    while (try session.next()) |operation_value| {
+    while (session.next()) |operation_value| {
         var operation = operation_value;
         operation.deinit();
     }
@@ -48,13 +48,14 @@ const Issued = struct {
     }
 };
 
-/// Runs queued upload work, releasing the issued operation on failure
+/// Ends input, then runs the queued work and releases every issued operation
 fn uploadAll(session: *xet.upload.Session, destination: *support.MemoryStore) !void {
-    while (try session.next()) |operation_value| {
+    try session.close();
+    while (session.next()) |operation_value| {
         var issued = Issued{ .operation = operation_value };
         defer issued.release();
-        switch (issued.operation) {
-            .store => |value| try destination.store().put(value.value),
+        switch (issued.operation.work) {
+            .store => |value| try destination.store().put(value),
             .reference => {},
         }
         issued.complete();
@@ -69,55 +70,323 @@ test "upload operations own deferred payloads and deduplicate multiple files" {
     defer session.deinit();
     errdefer discardUpload(&session) catch {};
     const data = "a moderately sized shared payload";
-    try session.addFile(10, data, .{ .compression = .none });
+    _ = try session.addFile(10, data, .{ .compression = .none });
     var second: xet.upload.File = undefined;
     try session.beginFile(&second, 20, .{ .compression = .none });
     for (data) |byte| try second.write(&.{byte});
-    try second.finish();
+    _ = try second.finish();
     second.deinit();
-    try session.addFile(30, "an independent file", .{ .compression = .none });
+    _ = try session.addFile(30, "an independent file", .{ .compression = .none });
+    try session.close();
 
     var remaining: [4]xet.upload.Operation = undefined;
     var remaining_count: usize = 0;
     defer for (remaining[0..remaining_count]) |*operation| operation.deinit();
     var references: usize = 0;
-    while (try session.next()) |operation| {
-        if (operation == .reference) references += 1;
+    while (session.next()) |operation| {
+        if (operation.work == .reference) references += 1;
         remaining[remaining_count] = operation;
         remaining_count += 1;
     }
-    try std.testing.expect((try session.next()) == null);
+    try std.testing.expect(session.next() == null);
     try std.testing.expectError(error.PendingOperations, session.finish());
-    try std.testing.expectEqual(@as(usize, 3), remaining_count);
-    try std.testing.expectEqual(@as(usize, 1), references);
+    // One open Xorb spans all three files, so only its close remains to store
+    try std.testing.expectEqual(@as(usize, 1), remaining_count);
+    try std.testing.expectEqual(@as(usize, 0), references);
     var index = remaining_count;
     while (index != 0) {
         index -= 1;
-        switch (remaining[index]) {
-            .reference => |value| try std.testing.expectEqual(@as(xet.upload.FileId, 20), value.file_id),
-            .store => |value| try destination.store().put(value.value),
+        switch (remaining[index].work) {
+            .reference => |value| try std.testing.expectEqual(
+                @as(xet.upload.FileId, 20),
+                value.file_id,
+            ),
+            .store => |value| try destination.store().put(value),
         }
         remaining[index].complete();
         remaining_count = index;
     }
+    try session.close();
     try session.finish();
-    try std.testing.expectEqual(@as(usize, 2), destination.count(.xorb));
+    try std.testing.expectEqual(@as(usize, 1), destination.count(.xorb));
     try std.testing.expectEqual(@as(usize, 1), destination.count(.shard));
-    try std.testing.expectEqual(@as(usize, 3), session.plans().len);
+    try std.testing.expectEqual(@as(usize, 3), session.packing.batch.plans.items.len);
 
     const shard_bytes = destination.objects.items[destination.objects.items.len - 1].data;
     const reader = try xet.shard.Reader.init(shard_bytes);
     try std.testing.expectEqual(@as(usize, 2), reader.footer.file_count);
     var opener = StoreOpener{ .store = &destination };
-    var manifest = try xet.reconstruction.planFromShard(
+    var manifest = try xet.recon.planFromShard(
         allocator,
         shard_bytes,
-        session.plans()[1].file.hash,
+        session.packing.batch.plans.items[1].file.hash,
     );
     defer manifest.deinit(allocator);
-    const reconstructed = try xet.reconstruction.reconstruct(allocator, &manifest.plan, opener.opener());
+    const reconstructed = try xet.recon.reconstruct(allocator, &manifest.plan, opener.opener());
     defer allocator.free(reconstructed);
     try std.testing.expectEqualStrings(data, reconstructed);
+}
+
+test "small files pack into one xorb and reconstruct independently" {
+    const allocator = std.testing.allocator;
+    var destination = support.MemoryStore{ .allocator = allocator };
+    defer destination.deinit();
+    var session = xet.upload.Session.init(allocator, destination.store(), .{});
+    defer session.deinit();
+    errdefer discardUpload(&session) catch {};
+    const inputs = [_][]const u8{ "alpha", "bravo" };
+    for (inputs, 0..) |input, index| _ = try session.addFile(index + 1, input, .{});
+    // The packed Xorb is still the caller's work
+    try std.testing.expectEqual(@as(usize, 0), session.pending());
+    try session.close();
+    var stores: usize = 0;
+    while (session.next()) |operation_value| {
+        var issued = Issued{ .operation = operation_value };
+        defer issued.release();
+        try destination.store().put(issued.operation.work.store);
+        issued.complete();
+        stores += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), stores);
+    try session.close();
+    try session.finish();
+    try std.testing.expectEqual(@as(usize, 1), destination.count(.xorb));
+    try std.testing.expectEqual(@as(usize, 1), destination.count(.shard));
+    try std.testing.expectEqual(inputs.len, session.packing.batch.plans.items.len);
+
+    const shard_bytes = destination.objects.items[destination.objects.items.len - 1].data;
+    const reader = try xet.shard.Reader.init(shard_bytes);
+    var shared: ?xet.Hash = null;
+    for (inputs, session.packing.batch.plans.items, 0..) |input, plan, index| {
+        const file = (try reader.findFile(plan.file.hash)).?;
+        const segment = try file.segment(0);
+        try std.testing.expectEqual(@as(u32, @intCast(index)), segment.chunk_index_start);
+        try std.testing.expectEqual(@as(u32, @intCast(index + 1)), segment.chunk_index_end);
+        if (shared) |hash| {
+            try std.testing.expectEqual(hash, segment.xorb_hash);
+        } else {
+            shared = segment.xorb_hash;
+        }
+        var opener = StoreOpener{ .store = &destination };
+        var manifest = try xet.recon.planFromShard(allocator, shard_bytes, plan.file.hash);
+        defer manifest.deinit(allocator);
+        const output = try xet.recon.reconstruct(allocator, &manifest.plan, opener.opener());
+        defer allocator.free(output);
+        try std.testing.expectEqualStrings(input, output);
+    }
+}
+
+/// Rejects Xorbs, so only the caller's worker can store them
+const ShardOnly = struct {
+    shards: support.MemoryStore,
+    xorbs: usize = 0,
+
+    fn put(raw: *anyopaque, object: xet.store.Object) !void {
+        const self: *ShardOnly = @ptrCast(@alignCast(raw));
+        if (object.kind == .xorb) {
+            self.xorbs += 1;
+            return error.XorbBypassedOperations;
+        }
+        try self.shards.store().put(object);
+    }
+};
+
+test "the final Xorb uses the operation queue instead of the session destination" {
+    const allocator = std.testing.allocator;
+    var destination = ShardOnly{ .shards = .{ .allocator = allocator } };
+    defer destination.shards.deinit();
+    var worker = support.MemoryStore{ .allocator = allocator };
+    defer worker.deinit();
+    var session = xet.upload.Session.init(
+        allocator,
+        .{ .context = &destination, .put_fn = ShardOnly.put },
+        .{},
+    );
+    defer session.deinit();
+    errdefer discardUpload(&session) catch {};
+
+    _ = try session.addFile(1, "alpha", .{ .compression = .none });
+    // Without an explicit close the open Xorb stays unreachable
+    try std.testing.expect(session.next() == null);
+    try std.testing.expectError(error.InputOpen, session.finish());
+    try session.close();
+
+    var issued = Issued{ .operation = session.next().? };
+    defer issued.release();
+    try worker.store().put(issued.operation.work.store);
+    issued.complete();
+    try session.close();
+    try session.finish();
+
+    try std.testing.expectEqual(@as(usize, 0), destination.xorbs);
+    try std.testing.expectEqual(@as(usize, 1), worker.count(.xorb));
+    try std.testing.expectEqual(@as(usize, 1), destination.shards.count(.shard));
+
+    const shard_bytes = destination.shards.objects.items[0].data;
+    var opener = StoreOpener{ .store = &worker };
+    var manifest = try xet.recon.planFromShard(
+        allocator,
+        shard_bytes,
+        session.packing.batch.plans.items[0].file.hash,
+    );
+    defer manifest.deinit(allocator);
+    const output = try xet.recon.reconstruct(allocator, &manifest.plan, opener.opener());
+    defer allocator.free(output);
+    try std.testing.expectEqualStrings("alpha", output);
+}
+
+test "close ends the input stream and rejects later files" {
+    const allocator = std.testing.allocator;
+    var destination = support.MemoryStore{ .allocator = allocator };
+    defer destination.deinit();
+    var session = xet.upload.Session.init(allocator, destination.store(), .{});
+    defer session.deinit();
+    errdefer discardUpload(&session) catch {};
+
+    _ = try session.addFile(1, "alpha", .{ .compression = .none });
+    try session.close();
+    try uploadAll(&session, &destination);
+    // A successful close stays successful
+    try session.close();
+
+    var rejected: xet.upload.File = undefined;
+    if (session.beginFile(&rejected, 2, .{ .compression = .none })) |_| {
+        rejected.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| try std.testing.expectEqual(error.InputClosed, err);
+    try std.testing.expectError(error.InputClosed, session.addFile(2, "bravo", .{}));
+
+    try session.close();
+    try session.finish();
+    try std.testing.expectEqual(@as(usize, 1), destination.count(.xorb));
+    try std.testing.expectEqual(@as(usize, 1), destination.count(.shard));
+    try std.testing.expectEqual(@as(usize, 1), session.packing.batch.plans.items.len);
+}
+
+test "close queues nothing after a worker reports failure" {
+    const allocator = std.testing.allocator;
+    var destination = support.MemoryStore{ .allocator = allocator };
+    defer destination.deinit();
+    var session = xet.upload.Session.init(allocator, destination.store(), .{});
+    defer session.deinit();
+
+    // The first file fills its one-chunk Xorb, so only its store is queued
+    _ = try session.addFile(1, "alpha", .{ .compression = .none, .max_xorb_chunks = 1 });
+    // The second file's chunk stays buffered in the shared Xorb until close
+    _ = try session.addFile(2, "beta", .{ .compression = .none });
+    var failed = Issued{ .operation = session.next().? };
+    try std.testing.expect(failed.operation.work == .store);
+    failed.release();
+
+    try std.testing.expectError(error.OperationFailed, session.close());
+    try std.testing.expectEqual(@as(usize, 0), session.pending());
+    try std.testing.expectEqual(@as(usize, 0), destination.count(.xorb));
+    try std.testing.expectError(error.OperationFailed, session.finish());
+    try std.testing.expectEqual(@as(usize, 0), destination.count(.shard));
+}
+
+test "many small files route every Xorb through the caller's worker" {
+    const allocator = std.testing.allocator;
+    var destination = ShardOnly{ .shards = .{ .allocator = allocator } };
+    defer destination.shards.deinit();
+    var worker = support.MemoryStore{ .allocator = allocator };
+    defer worker.deinit();
+    var session = xet.upload.Session.init(
+        allocator,
+        .{ .context = &destination, .put_fn = ShardOnly.put },
+        .{},
+    );
+    defer session.deinit();
+    errdefer discardUpload(&session) catch {};
+
+    // Each input ends in a byte that keeps the four-byte files distinct
+    const count = 1000;
+    var stores: usize = 0;
+    var input: [4]u8 = undefined;
+    for (0..count) |i| {
+        std.mem.writeInt(u32, &input, @intCast(i), .little);
+        _ = try session.addFile(i, &input, .{ .compression = .none });
+        // Draining as the caller goes keeps the queue bounded
+        while (session.next()) |operation_value| {
+            var issued = Issued{ .operation = operation_value };
+            try worker.store().put(issued.operation.work.store);
+            issued.complete();
+            stores += 1;
+        }
+    }
+    try session.close();
+    while (session.next()) |operation_value| {
+        var issued = Issued{ .operation = operation_value };
+        defer issued.release();
+        try worker.store().put(issued.operation.work.store);
+        issued.complete();
+        stores += 1;
+    }
+    try session.close();
+    try session.finish();
+
+    // One packed Xorb for the whole run, and no Xorb bypassed the queue
+    try std.testing.expectEqual(@as(usize, 1), stores);
+    try std.testing.expectEqual(@as(usize, 0), destination.xorbs);
+    try std.testing.expectEqual(@as(usize, 1), worker.count(.xorb));
+    try std.testing.expectEqual(@as(usize, 1), destination.shards.count(.shard));
+    try std.testing.expectEqual(@as(usize, count), session.packing.batch.plans.items.len);
+
+    const shard_bytes = destination.shards.objects.items[0].data;
+    var opener = StoreOpener{ .store = &worker };
+    for (0..count) |i| {
+        std.mem.writeInt(u32, &input, @intCast(i), .little);
+        var manifest = try xet.recon.planFromShard(
+            allocator,
+            shard_bytes,
+            session.packing.batch.plans.items[i].file.hash,
+        );
+        defer manifest.deinit(allocator);
+        const output = try xet.recon.reconstruct(allocator, &manifest.plan, opener.opener());
+        defer allocator.free(output);
+        try std.testing.expectEqualSlices(u8, &input, output);
+    }
+}
+
+test "deinitializing a finished file keeps the next file's upload listener" {
+    const allocator = std.testing.allocator;
+    var destination = support.MemoryStore{ .allocator = allocator };
+    defer destination.deinit();
+    var session = xet.upload.Session.init(allocator, destination.store(), .{});
+    defer session.deinit();
+    errdefer discardUpload(&session) catch {};
+    const opts: xet.store.PackOptions = .{ .compression = .none, .max_xorb_chunks = 1 };
+
+    var first: xet.upload.File = undefined;
+    try session.beginFile(&first, 1, opts);
+    try first.write("alpha");
+    _ = try first.finish();
+
+    var second: xet.upload.File = undefined;
+    try session.beginFile(&second, 2, opts);
+    try second.write("bravo");
+    // The stale handle still reaches the session's shared writer
+    first.deinit();
+    try second.write("charlie");
+    _ = try second.finish();
+    second.deinit();
+
+    try uploadAll(&session, &destination);
+    try session.close();
+    try session.finish();
+    try std.testing.expectEqual(@as(usize, 2), destination.count(.xorb));
+
+    const shard_bytes = destination.objects.items[destination.objects.items.len - 1].data;
+    var opener = StoreOpener{ .store = &destination };
+    var manifest = try xet.recon.planFromShard(
+        allocator,
+        shard_bytes,
+        session.packing.batch.plans.items[1].file.hash,
+    );
+    defer manifest.deinit(allocator);
+    const output = try xet.recon.reconstruct(allocator, &manifest.plan, opener.opener());
+    defer allocator.free(output);
+    try std.testing.expectEqualStrings("bravocharlie", output);
 }
 
 test "upload queue allocation failures release retained operations" {
@@ -126,7 +395,7 @@ test "upload queue allocation failures release retained operations" {
     var baseline_tracker = support.TrackingAllocator{ .backing = allocator };
     var baseline = support.MemoryStore{ .allocator = baseline_tracker.allocator() };
     var session = xet.upload.Session.init(baseline_tracker.allocator(), baseline.store(), .{});
-    try session.addFile(1, data, .{ .compression = .none });
+    _ = try session.addFile(1, data, .{ .compression = .none });
     try discardUpload(&session);
     session.deinit();
     baseline.deinit();
@@ -141,7 +410,11 @@ test "upload queue allocation failures release retained operations" {
             defer destination.deinit();
             var current = xet.upload.Session.init(tracker.allocator(), destination.store(), .{});
             defer current.deinit();
-            try std.testing.expectError(error.OutOfMemory, current.addFile(1, data, .{ .compression = .none }));
+            try std.testing.expectError(error.OutOfMemory, current.addFile(
+                1,
+                data,
+                .{ .compression = .none },
+            ));
             try discardUpload(&current);
         }
         try std.testing.expectEqual(@as(usize, 0), tracker.outstanding());
@@ -160,50 +433,89 @@ test "upload supports fixed chunks and canonical defaults simultaneously" {
         .{ .hash = xet.hash.data("ij"), .size = 2 },
     };
     const expected_hash = try xet.hash.file(allocator, &expected_nodes);
-    var fixed = try xet.Fixed.init(4);
+    var fixed = try xet.chunker.Fixed.init(4);
     var destination = support.MemoryStore{ .allocator = allocator };
     defer destination.deinit();
     var session = xet.upload.Session.init(allocator, destination.store(), .{});
     defer session.deinit();
     errdefer discardUpload(&session) catch {};
 
-    try session.addFile(1, data, .{ .compression = .none });
-    try session.addFile(2, data, .{ .compression = .none, .strategy = fixed.strategy() });
-    while (try session.next()) |operation_value| {
+    _ = try session.addFile(1, data, .{ .compression = .none });
+    _ = try session.addFile(2, data, .{ .compression = .none, .strategy = fixed.strategy() });
+    try session.close();
+    while (session.next()) |operation_value| {
         var issued = Issued{ .operation = operation_value };
         defer issued.release();
-        switch (issued.operation) {
-            .reference => |value| try std.testing.expectEqual(@as(xet.upload.FileId, 2), value.file_id),
-            .store => |value| try destination.store().put(value.value),
+        switch (issued.operation.work) {
+            .reference => |value| try std.testing.expectEqual(
+                @as(xet.upload.FileId, 2),
+                value.file_id,
+            ),
+            .store => |value| try destination.store().put(value),
         }
         issued.complete();
     }
+    try session.close();
     try session.finish();
-    try std.testing.expect(!xet.hash.eql(session.plans()[0].file.hash, expected_hash));
-    try std.testing.expect(xet.hash.eql(session.plans()[1].file.hash, expected_hash));
-    try std.testing.expectEqual(@as(usize, 3), session.plans()[1].file.segments[0].chunk_index_end);
-    var package = try xet.pack(allocator, data, .{ .compression = .none, .strategy = fixed.strategy() });
+    try std.testing.expect(!xet.hash.eql(
+        session.packing.batch.plans.items[0].file.hash,
+        expected_hash,
+    ));
+    try std.testing.expect(xet.hash.eql(
+        session.packing.batch.plans.items[1].file.hash,
+        expected_hash,
+    ));
+    // Both files share one Xorb, so the second file's three chunks start at one
+    try std.testing.expectEqual(
+        @as(u32, 1),
+        session.packing.batch.plans.items[1].file.segments[0].chunk_index_start,
+    );
+    try std.testing.expectEqual(
+        @as(u32, 4),
+        session.packing.batch.plans.items[1].file.segments[0].chunk_index_end,
+    );
+    var package = try xet.store.pack(
+        allocator,
+        data,
+        .{ .compression = .none, .strategy = fixed.strategy() },
+    );
     defer package.deinit(allocator);
     try std.testing.expect(xet.hash.eql(package.file_hash, expected_hash));
 
     const shard_bytes = destination.objects.items[destination.objects.items.len - 1].data;
-    var manifest = try xet.reconstruction.planFromShard(allocator, shard_bytes, expected_hash);
+    var manifest = try xet.recon.planFromShard(allocator, shard_bytes, expected_hash);
     defer manifest.deinit(allocator);
     var opener = StoreOpener{ .store = &destination };
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    _ = try xet.consumeWith(allocator, &manifest.plan, opener.opener(), &output.writer, fixed.strategy());
+    _ = try xet.recon.consumeWith(
+        allocator,
+        &manifest.plan,
+        opener.opener(),
+        &output.writer,
+        fixed.strategy(),
+    );
     try std.testing.expectEqualStrings(data, output.written());
 
     output.clearRetainingCapacity();
-    _ = try xet.reconstruction.consumeVerified(allocator, &manifest.plan, opener.opener(), manifest.chunks, &output.writer);
+    _ = try xet.recon.consumeVerified(
+        allocator,
+        &manifest.plan,
+        opener.opener(),
+        manifest.chunks,
+        &output.writer,
+    );
     try std.testing.expectEqualStrings(data, output.written());
 }
 
 const ExternalSource = struct {
     object: *const xet.xorb.Serialized,
 
-    fn query(raw: *anyopaque, query_allocator: std.mem.Allocator, hashes: []const xet.Hash) !?xet.DedupMatch {
+    fn query(
+        raw: *anyopaque,
+        query_allocator: std.mem.Allocator,
+        hashes: []const xet.Hash,
+    ) !?xet.dedup.Match {
         const self: *@This() = @ptrCast(@alignCast(raw));
         if (hashes.len == 0 or !xet.hash.eql(hashes[0], self.object.nodes[0].hash)) return null;
         const nodes = try query_allocator.dupe(xet.hash.Node, self.object.nodes);
@@ -222,7 +534,7 @@ test "upload reference queue allocation failures release cloned metadata" {
     var session = xet.upload.Session.init(baseline_tracker.allocator(), baseline.store(), .{
         .dedup_source = .{ .context = &source, .query_fn = ExternalSource.query },
     });
-    try session.addFile(1, data, .{ .compression = .none });
+    _ = try session.addFile(1, data, .{ .compression = .none });
     try discardUpload(&session);
     session.deinit();
     baseline.deinit();
@@ -239,7 +551,11 @@ test "upload reference queue allocation failures release cloned metadata" {
                 .dedup_source = .{ .context = &source, .query_fn = ExternalSource.query },
             });
             defer current.deinit();
-            try std.testing.expectError(error.OutOfMemory, current.addFile(1, data, .{ .compression = .none }));
+            try std.testing.expectError(error.OutOfMemory, current.addFile(
+                1,
+                data,
+                .{ .compression = .none },
+            ));
             try discardUpload(&current);
         }
         try std.testing.expectEqual(@as(usize, 0), tracker.outstanding());
@@ -262,12 +578,13 @@ test "upload accepts an external deduplication source" {
     });
     defer session.deinit();
     errdefer discardUpload(&session) catch {};
-    try session.addFile(1, data, .{ .compression = .none });
-    var issued = Issued{ .operation = (try session.next()).? };
+    _ = try session.addFile(1, data, .{ .compression = .none });
+    var issued = Issued{ .operation = session.next().? };
     defer issued.release();
-    try std.testing.expect(issued.operation == .reference);
+    try std.testing.expect(issued.operation.work == .reference);
     issued.complete();
-    try std.testing.expect((try session.next()) == null);
+    try std.testing.expect(session.next() == null);
+    try session.close();
     try session.finish();
     try std.testing.expectEqual(@as(usize, 0), destination.count(.xorb));
     try std.testing.expectEqual(@as(usize, 1), destination.count(.shard));
@@ -275,10 +592,18 @@ test "upload accepts an external deduplication source" {
 
 /// Returns the queried hash with a size unrelated to the buffered input
 const MismatchedSizeSource = struct {
-    fn query(_: *anyopaque, query_allocator: std.mem.Allocator, hashes: []const xet.Hash) !?xet.DedupMatch {
+    fn query(
+        _: *anyopaque,
+        query_allocator: std.mem.Allocator,
+        hashes: []const xet.Hash,
+    ) !?xet.dedup.Match {
         const nodes = try query_allocator.alloc(xet.hash.Node, 1);
         nodes[0] = .{ .hash = hashes[0], .size = 42 };
-        return .{ .nodes = nodes, .xorb_hash = xet.hash.data("external xorb"), .chunk_index_start = 0 };
+        return .{
+            .nodes = nodes,
+            .xorb_hash = xet.hash.data("external xorb"),
+            .chunk_index_start = 0,
+        };
     }
 };
 
@@ -297,14 +622,14 @@ test "upload rejects external dedup matches whose sizes disagree with input" {
         session.addFile(1, "A", .{ .compression = .none }),
     );
     try std.testing.expectEqual(@as(usize, 0), session.pending());
-    try std.testing.expectEqual(@as(usize, 0), session.plans().len);
+    try std.testing.expectEqual(@as(usize, 0), session.packing.batch.plans.items.len);
     try std.testing.expectEqual(@as(usize, 0), destination.count(.shard));
 }
 
 test "upload references a duplicate xorb instead of silently dropping it" {
     const allocator = std.testing.allocator;
-    var fixed = try xet.Fixed.init(1);
-    const opts = xet.PackOptions{
+    var fixed = try xet.chunker.Fixed.init(1);
+    const opts = xet.store.PackOptions{
         .compression = .none,
         .max_xorb_chunks = 1,
         .strategy = fixed.strategy(),
@@ -314,16 +639,16 @@ test "upload references a duplicate xorb instead of silently dropping it" {
     var session = xet.upload.Session.init(allocator, destination.store(), .{});
     defer session.deinit();
     errdefer discardUpload(&session) catch {};
-    try session.addFile(1, "aa", opts);
+    _ = try session.addFile(1, "aa", opts);
 
     var stores: usize = 0;
     var references: usize = 0;
-    while (try session.next()) |operation_value| {
+    while (session.next()) |operation_value| {
         var issued = Issued{ .operation = operation_value };
         defer issued.release();
-        switch (issued.operation) {
+        switch (issued.operation.work) {
             .store => |value| {
-                try destination.store().put(value.value);
+                try destination.store().put(value);
                 stores += 1;
             },
             .reference => references += 1,
@@ -332,31 +657,212 @@ test "upload references a duplicate xorb instead of silently dropping it" {
     }
     try std.testing.expectEqual(@as(usize, 1), stores);
     try std.testing.expectEqual(@as(usize, 1), references);
+    try session.close();
     try session.finish();
     try std.testing.expectEqual(@as(usize, 1), destination.count(.xorb));
     try std.testing.expectEqual(@as(usize, 1), destination.count(.shard));
-    try std.testing.expectEqual(@as(usize, 2), session.plans()[0].file.segments.len);
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        session.packing.batch.plans.items[0].file.segments.len,
+    );
 
     const shard_bytes = destination.objects.items[destination.objects.items.len - 1].data;
-    var manifest = try xet.reconstruction.planFromShard(
+    var manifest = try xet.recon.planFromShard(
         allocator,
         shard_bytes,
-        session.plans()[0].file.hash,
+        session.packing.batch.plans.items[0].file.hash,
     );
     defer manifest.deinit(allocator);
     var opener = StoreOpener{ .store = &destination };
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    _ = try xet.consumeWith(allocator, &manifest.plan, opener.opener(), &output.writer, fixed.strategy());
+    _ = try xet.recon.consumeWith(
+        allocator,
+        &manifest.plan,
+        opener.opener(),
+        &output.writer,
+        fixed.strategy(),
+    );
     try std.testing.expectEqualStrings("aa", output.written());
+}
+
+test "duplicate files reference the open xorb instead of closing it" {
+    const allocator = std.testing.allocator;
+    const count = 500;
+    var destination = support.MemoryStore{ .allocator = allocator };
+    defer destination.deinit();
+    var session = xet.upload.Session.init(allocator, destination.store(), .{});
+    defer session.deinit();
+    errdefer discardUpload(&session) catch {};
+
+    var input: [4]u8 = undefined;
+    for (0..count) |i| {
+        std.mem.writeInt(u32, &input, @intCast(i), .little);
+        _ = try session.addFile(2 * i + 1, &input, .{ .compression = .none });
+        _ = try session.addFile(2 * i + 2, &input, .{ .compression = .none });
+    }
+    try uploadAll(&session, &destination);
+    try session.close();
+    try session.finish();
+
+    // Every duplicate stays in the open Xorb instead of closing it
+    try std.testing.expectEqual(@as(usize, 1), destination.count(.xorb));
+    try std.testing.expectEqual(@as(usize, 1), destination.count(.shard));
+    for (session.packing.batch.plans.items) |plan| {
+        for (plan.file.segments) |segment|
+            try std.testing.expect(!xet.hash.eql(segment.xorb_hash, xet.hash.zero));
+    }
+
+    const shard_bytes = destination.objects.items[destination.objects.items.len - 1].data;
+    const reader = try xet.shard.Reader.init(shard_bytes);
+    try std.testing.expectEqual(@as(u32, count), reader.footer.file_count);
+    var opener = StoreOpener{ .store = &destination };
+    var manifest = try xet.recon.planFromShard(
+        allocator,
+        shard_bytes,
+        session.packing.batch.plans.items[0].file.hash,
+    );
+    defer manifest.deinit(allocator);
+    const output = try xet.recon.reconstruct(allocator, &manifest.plan, opener.opener());
+    defer allocator.free(output);
+    std.mem.writeInt(u32, &input, 0, .little);
+    try std.testing.expectEqualSlices(u8, &input, output);
+}
+
+test "a file references chunks the open xorb already holds" {
+    const allocator = std.testing.allocator;
+    var fixed = try xet.chunker.Fixed.init(1);
+    const opts: xet.store.PackOptions = .{ .compression = .none, .strategy = fixed.strategy() };
+    var destination = support.MemoryStore{ .allocator = allocator };
+    defer destination.deinit();
+    var session = xet.upload.Session.init(allocator, destination.store(), .{});
+    defer session.deinit();
+    errdefer discardUpload(&session) catch {};
+    _ = try session.addFile(1, "a", opts);
+    _ = try session.addFile(2, "ab", opts);
+    try uploadAll(&session, &destination);
+    try session.close();
+    try session.finish();
+
+    try std.testing.expectEqual(@as(usize, 1), destination.count(.xorb));
+    const shard_bytes = destination.objects.items[destination.objects.items.len - 1].data;
+    const reader = try xet.shard.Reader.init(shard_bytes);
+    const file = (try reader.findFile(session.packing.batch.plans.items[1].file.hash)).?;
+    try std.testing.expectEqual(@as(u32, 2), file.count);
+    const repeated = try file.segment(0);
+    const fresh = try file.segment(1);
+    try std.testing.expectEqual(repeated.xorb_hash, fresh.xorb_hash);
+    try std.testing.expectEqual(@as(u32, 0), repeated.chunk_index_start);
+    try std.testing.expectEqual(@as(u32, 1), repeated.chunk_index_end);
+    try std.testing.expectEqual(@as(u32, 1), fresh.chunk_index_start);
+    try std.testing.expectEqual(@as(u32, 2), fresh.chunk_index_end);
+
+    var opener = StoreOpener{ .store = &destination };
+    var manifest = try xet.recon.planFromShard(
+        allocator,
+        shard_bytes,
+        session.packing.batch.plans.items[1].file.hash,
+    );
+    defer manifest.deinit(allocator);
+    manifest.plan.file_hash = null;
+    const output = try xet.recon.reconstruct(allocator, &manifest.plan, opener.opener());
+    defer allocator.free(output);
+    try std.testing.expectEqualStrings("ab", output);
+}
+
+test "a repeated chunk keeps file order around a new chunk" {
+    const allocator = std.testing.allocator;
+    var fixed = try xet.chunker.Fixed.init(1);
+    const opts: xet.store.PackOptions = .{ .compression = .none, .strategy = fixed.strategy() };
+    var destination = support.MemoryStore{ .allocator = allocator };
+    defer destination.deinit();
+    var session = xet.upload.Session.init(allocator, destination.store(), .{});
+    defer session.deinit();
+    errdefer discardUpload(&session) catch {};
+    _ = try session.addFile(1, "a", opts);
+    _ = try session.addFile(2, "aba", opts);
+    try uploadAll(&session, &destination);
+    try session.close();
+    try session.finish();
+
+    try std.testing.expectEqual(@as(usize, 1), destination.count(.xorb));
+    const shard_bytes = destination.objects.items[destination.objects.items.len - 1].data;
+    const reader = try xet.shard.Reader.init(shard_bytes);
+    const file = (try reader.findFile(session.packing.batch.plans.items[1].file.hash)).?;
+    try std.testing.expectEqual(@as(u32, 3), file.count);
+    const first = try file.segment(0);
+    const middle = try file.segment(1);
+    const last = try file.segment(2);
+    try std.testing.expectEqual(first.xorb_hash, middle.xorb_hash);
+    try std.testing.expectEqual(first.xorb_hash, last.xorb_hash);
+    // The trailing repeat names chunk zero, so the middle term keeps file order
+    try std.testing.expectEqual(@as(u32, 0), first.chunk_index_start);
+    try std.testing.expectEqual(@as(u32, 1), first.chunk_index_end);
+    try std.testing.expectEqual(@as(u32, 1), middle.chunk_index_start);
+    try std.testing.expectEqual(@as(u32, 2), middle.chunk_index_end);
+    try std.testing.expectEqual(@as(u32, 0), last.chunk_index_start);
+    try std.testing.expectEqual(@as(u32, 1), last.chunk_index_end);
+
+    var opener = StoreOpener{ .store = &destination };
+    var manifest = try xet.recon.planFromShard(
+        allocator,
+        shard_bytes,
+        session.packing.batch.plans.items[1].file.hash,
+    );
+    defer manifest.deinit(allocator);
+    manifest.plan.file_hash = null;
+    const output = try xet.recon.reconstruct(allocator, &manifest.plan, opener.opener());
+    defer allocator.free(output);
+    try std.testing.expectEqualStrings("aba", output);
+}
+
+test "a repeat splits segments inside one file" {
+    const allocator = std.testing.allocator;
+    var fixed = try xet.chunker.Fixed.init(1);
+    const opts: xet.store.PackOptions = .{ .compression = .none, .strategy = fixed.strategy() };
+    var destination = support.MemoryStore{ .allocator = allocator };
+    defer destination.deinit();
+    var session = xet.upload.Session.init(allocator, destination.store(), .{});
+    defer session.deinit();
+    errdefer discardUpload(&session) catch {};
+    _ = try session.addFile(1, "aab", opts);
+    try uploadAll(&session, &destination);
+    try session.close();
+    try session.finish();
+
+    try std.testing.expectEqual(@as(usize, 1), destination.count(.xorb));
+    const shard_bytes = destination.objects.items[destination.objects.items.len - 1].data;
+    const reader = try xet.shard.Reader.init(shard_bytes);
+    const file = (try reader.findFile(session.packing.batch.plans.items[0].file.hash)).?;
+    const first = try file.segment(0);
+    const second = try file.segment(1);
+    const third = try file.segment(2);
+    // Segments must keep file order: a, then a, then b
+    try std.testing.expectEqual(@as(u32, 1), first.chunk_index_end - first.chunk_index_start);
+    try std.testing.expectEqual(@as(u32, 0), second.chunk_index_start);
+    try std.testing.expectEqual(@as(u32, 1), second.chunk_index_end);
+    try std.testing.expectEqual(@as(u32, 1), third.chunk_index_start);
+    try std.testing.expectEqual(@as(u32, 2), third.chunk_index_end);
+
+    var opener = StoreOpener{ .store = &destination };
+    var manifest = try xet.recon.planFromShard(
+        allocator,
+        shard_bytes,
+        session.packing.batch.plans.items[0].file.hash,
+    );
+    defer manifest.deinit(allocator);
+    manifest.plan.file_hash = null;
+    const output = try xet.recon.reconstruct(allocator, &manifest.plan, opener.opener());
+    defer allocator.free(output);
+    try std.testing.expectEqualStrings("aab", output);
 }
 
 test "upload store failure survives cleanup with zero outstanding operations" {
     const allocator = std.testing.allocator;
     var tracker = support.TrackingAllocator{ .backing = allocator };
     defer tracker.deinit();
-    var fixed = try xet.Fixed.init(1);
-    const opts = xet.PackOptions{
+    var fixed = try xet.chunker.Fixed.init(1);
+    const opts = xet.store.PackOptions{
         .compression = .none,
         .max_xorb_chunks = 1,
         .strategy = fixed.strategy(),
@@ -366,7 +872,7 @@ test "upload store failure survives cleanup with zero outstanding operations" {
         defer destination.deinit();
         var session = xet.upload.Session.init(tracker.allocator(), destination.store(), .{});
         defer session.deinit();
-        try session.addFile(1, "aa", opts);
+        _ = try session.addFile(1, "aa", opts);
 
         // The issued operation is released before the session can assert
         try std.testing.expectError(error.InjectedStoreFailure, uploadAll(&session, &destination));
@@ -388,11 +894,11 @@ const ReentrantSource = struct {
     nested_finish: ?anyerror = null,
     nested_begin: ?anyerror = null,
 
-    fn source(self: *ReentrantSource) xet.DedupSource {
+    fn source(self: *ReentrantSource) xet.dedup.Source {
         return .{ .context = self, .query_fn = query };
     }
 
-    fn query(raw: *anyopaque, _: std.mem.Allocator, _: []const xet.Hash) !?xet.DedupMatch {
+    fn query(raw: *anyopaque, _: std.mem.Allocator, _: []const xet.Hash) !?xet.dedup.Match {
         const self: *ReentrantSource = @ptrCast(@alignCast(raw));
         self.queries += 1;
         const session = self.session orelse return null;
@@ -424,7 +930,7 @@ test "upload keeps the active file guard through plan finalization" {
     try session.beginFile(&file, 1, .{ .compression = .none });
     source.session = &session;
     try file.write("payload re-entering the upload session");
-    try file.finish();
+    _ = try file.finish();
     file.deinit();
     source.session = null;
 
@@ -435,8 +941,9 @@ test "upload keeps the active file guard through plan finalization" {
     try session.beginFile(&probe, 2, .{ .compression = .none });
     probe.deinit();
     try uploadAll(&session, &destination);
+    try session.close();
     try session.finish();
-    try std.testing.expectEqual(@as(usize, 1), session.plans().len);
+    try std.testing.expectEqual(@as(usize, 1), session.packing.batch.plans.items.len);
     try std.testing.expectEqual(@as(usize, 1), destination.count(.shard));
 }
 
@@ -447,8 +954,9 @@ test "upload cancelled operations prevent metadata publication" {
     var session = xet.upload.Session.init(allocator, destination.store(), .{});
     defer session.deinit();
     errdefer discardUpload(&session) catch {};
-    try session.addFile(1, "new payload", .{ .compression = .none });
-    var operation = (try session.next()).?;
+    // A single-chunk limit closes the Xorb and emits its store operation
+    _ = try session.addFile(1, "new payload", .{ .compression = .none, .max_xorb_chunks = 1 });
+    var operation = session.next().?;
     operation.deinit();
     try std.testing.expectError(error.OperationFailed, session.finish());
     var rejected: xet.upload.File = undefined;
@@ -464,21 +972,21 @@ test "upload discards queued work when a file is abandoned" {
     const allocator = std.testing.allocator;
     var tracker = support.TrackingAllocator{ .backing = allocator };
     defer tracker.deinit();
-    var fixed = try xet.Fixed.init(2);
-    const opts = xet.PackOptions{
+    var fixed = try xet.chunker.Fixed.init(2);
+    const opts = xet.store.PackOptions{
         .compression = .none,
         .max_xorb_chunks = 1,
         .strategy = fixed.strategy(),
     };
     const abandoned = @as([2 * chunks_per_file]u8, @splat('b'));
-    var package = try xet.pack(allocator, "aa", opts);
+    var package = try xet.store.pack(allocator, "aa", opts);
     defer package.deinit(allocator);
     {
         var destination = support.MemoryStore{ .allocator = tracker.allocator() };
         defer destination.deinit();
         var session = xet.upload.Session.init(tracker.allocator(), destination.store(), .{});
         defer session.deinit();
-        try session.addFile(1, "aa", opts);
+        _ = try session.addFile(1, "aa", opts);
 
         var file: xet.upload.File = undefined;
         try session.beginFile(&file, 2, opts);
@@ -487,13 +995,13 @@ test "upload discards queued work when a file is abandoned" {
         file.deinit();
         try std.testing.expectEqual(@as(usize, 1), session.pending());
 
-        var issued = Issued{ .operation = (try session.next()).? };
+        var issued = Issued{ .operation = session.next().? };
         defer issued.release();
-        try std.testing.expect(issued.operation == .store);
-        try std.testing.expectEqual(@as(xet.upload.FileId, 1), issued.operation.store.file_id);
-        try destination.store().put(issued.operation.store.value);
+        try std.testing.expect(issued.operation.work == .store);
+        try destination.store().put(issued.operation.work.store);
         issued.complete();
-        try std.testing.expect((try session.next()) == null);
+        try std.testing.expect(session.next() == null);
+        try session.close();
         try session.finish();
 
         try std.testing.expectEqual(@as(usize, 1), destination.count(.xorb));
@@ -515,7 +1023,7 @@ const FaultyChunks = struct {
     session: ?*xet.upload.Session = null,
     queued: usize = 0,
 
-    fn strategy(self: *FaultyChunks) xet.Strategy {
+    fn strategy(self: *FaultyChunks) xet.chunker.Strategy {
         return .{ .context = self, .next_fn = next };
     }
 
@@ -537,14 +1045,14 @@ test "upload discards queued work when a write fails after enqueue" {
     const allocator = std.testing.allocator;
     var tracker = support.TrackingAllocator{ .backing = allocator };
     defer tracker.deinit();
-    var fixed = try xet.Fixed.init(2);
-    const good = xet.PackOptions{
+    var fixed = try xet.chunker.Fixed.init(2);
+    const good = xet.store.PackOptions{
         .compression = .none,
         .max_xorb_chunks = 1,
         .strategy = fixed.strategy(),
     };
     var faulty = FaultyChunks{ .size = 2, .fail_at = chunks_per_file };
-    const bad = xet.PackOptions{
+    const bad = xet.store.PackOptions{
         .compression = .none,
         .max_xorb_chunks = 1,
         .strategy = faulty.strategy(),
@@ -555,7 +1063,7 @@ test "upload discards queued work when a write fails after enqueue" {
         defer destination.deinit();
         var session = xet.upload.Session.init(tracker.allocator(), destination.store(), .{});
         defer session.deinit();
-        try session.addFile(1, "aa", good);
+        _ = try session.addFile(1, "aa", good);
 
         faulty.session = &session;
         var file: xet.upload.File = undefined;
@@ -567,13 +1075,13 @@ test "upload discards queued work when a write fails after enqueue" {
         file.deinit();
         try std.testing.expectEqual(@as(usize, 1), session.pending());
 
-        var issued = Issued{ .operation = (try session.next()).? };
+        var issued = Issued{ .operation = session.next().? };
         defer issued.release();
-        try std.testing.expect(issued.operation == .store);
-        try std.testing.expectEqual(@as(xet.upload.FileId, 1), issued.operation.store.file_id);
-        try destination.store().put(issued.operation.store.value);
+        try std.testing.expect(issued.operation.work == .store);
+        try destination.store().put(issued.operation.work.store);
         issued.complete();
-        try std.testing.expect((try session.next()) == null);
+        try std.testing.expect(session.next() == null);
+        try session.close();
         try session.finish();
         try std.testing.expectEqual(@as(usize, 1), destination.count(.xorb));
         try std.testing.expectEqual(@as(usize, 1), destination.count(.shard));
@@ -583,10 +1091,391 @@ test "upload discards queued work when a write fails after enqueue" {
     try std.testing.expectEqual(@as(usize, 0), tracker.invalid_frees);
 }
 
+test "a session cannot roll the writer back under the active file" {
+    const allocator = std.testing.allocator;
+    var destination = support.MemoryStore{ .allocator = allocator };
+    defer destination.deinit();
+    var session = xet.upload.Session.init(allocator, destination.store(), .{});
+    defer session.deinit();
+    errdefer discardUpload(&session) catch {};
+    var fixed = try xet.chunker.Fixed.init(1);
+    const opts = xet.store.PackOptions{
+        .compression = .none,
+        .strategy = fixed.strategy(),
+    };
+
+    var file: xet.upload.File = undefined;
+    try session.beginFile(&file, 1, opts);
+    defer file.deinit();
+    try file.write("a");
+
+    // The live file's segment names the open Xorb's first chunk
+    try std.testing.expectError(error.ActivePublisher, session.packing.writer.rollback());
+    try std.testing.expectError(error.ActivePublisher, session.packing.writer.discardBuffered());
+    try file.write("b");
+    _ = try file.finish();
+    try uploadAll(&session, &destination);
+    try session.close();
+    try session.finish();
+
+    const shard_bytes = destination.objects.items[destination.objects.items.len - 1].data;
+    var manifest = try xet.recon.planFromShard(
+        allocator,
+        shard_bytes,
+        session.packing.batch.plans.items[0].file.hash,
+    );
+    defer manifest.deinit(allocator);
+    var opener = StoreOpener{ .store = &destination };
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    _ = try xet.recon.consumeWith(
+        allocator,
+        &manifest.plan,
+        opener.opener(),
+        &output.writer,
+        fixed.strategy(),
+    );
+    try std.testing.expectEqualStrings("ab", output.written());
+}
+
+test "a file aborted by its final boundary callback never reaches the shard" {
+    const allocator = std.testing.allocator;
+    const Aborting = struct {
+        file: ?*xet.upload.File = null,
+        aborted: bool = false,
+
+        fn strategy(self: *@This()) xet.chunker.Strategy {
+            return .{ .context = self, .next_fn = next };
+        }
+
+        fn next(raw: *anyopaque, _: []const u8, input: []const u8) !?usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (input.len != 0) return input.len;
+            // This final boundary runs inside the publisher's own finalization
+            if (!self.aborted) {
+                self.aborted = true;
+                self.file.?.publisher.abort();
+            }
+            return null;
+        }
+    };
+    var destination = support.MemoryStore{ .allocator = allocator };
+    defer destination.deinit();
+    var state = Aborting{};
+    var session = xet.upload.Session.init(allocator, destination.store(), .{});
+    defer session.deinit();
+    errdefer discardUpload(&session) catch {};
+
+    var file: xet.upload.File = undefined;
+    try session.beginFile(&file, 1, .{ .compression = .none, .strategy = state.strategy() });
+    state.file = &file;
+    try file.write("abandoned");
+
+    try std.testing.expectError(error.WriteFailed, file.finish());
+    file.deinit();
+    state.file = null;
+
+    try uploadAll(&session, &destination);
+    try session.close();
+    try session.finish();
+    try std.testing.expectEqual(@as(usize, 0), session.packing.batch.plans.items.len);
+    try std.testing.expectEqual(@as(usize, 0), destination.count(.shard));
+}
+
+test "the append window keeps a finished file's chunks until the plan is accepted" {
+    const allocator = std.testing.allocator;
+    var destination = support.MemoryStore{ .allocator = allocator };
+    defer destination.deinit();
+    var session = xet.upload.Session.init(allocator, destination.store(), .{});
+    defer session.deinit();
+    errdefer discardUpload(&session) catch {};
+    var fixed = try xet.chunker.Fixed.init(1);
+    const opts = xet.store.PackOptions{
+        .compression = .none,
+        .strategy = fixed.strategy(),
+    };
+
+    // finish accepts the plan, so the session must commit after append, not before it
+    var file: xet.upload.File = undefined;
+    try session.beginFile(&file, 1, opts);
+    try file.write("a");
+    _ = try file.finish();
+    file.deinit();
+
+    // A raw cleanup after acceptance must stop below the chunks the plan names
+    try session.packing.writer.rollback();
+    try session.packing.writer.discardBuffered();
+    try std.testing.expectEqual(@as(u32, 1), session.packing.writer.count());
+
+    try uploadAll(&session, &destination);
+    try session.close();
+    try session.finish();
+    try reconstructUploaded(
+        allocator,
+        &destination,
+        session.packing.batch.plans.items[0].file.hash,
+        "a",
+        fixed.strategy(),
+    );
+}
+
+fn reconstructUploaded(
+    allocator: std.mem.Allocator,
+    destination: *support.MemoryStore,
+    file_hash: xet.Hash,
+    expected: []const u8,
+    strategy: xet.chunker.Strategy,
+) !void {
+    const shard_bytes = destination.objects.items[destination.objects.items.len - 1].data;
+    var manifest = try xet.recon.planFromShard(allocator, shard_bytes, file_hash);
+    defer manifest.deinit(allocator);
+    var opener = StoreOpener{ .store = destination };
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    _ = try xet.recon.consumeWith(
+        allocator,
+        &manifest.plan,
+        opener.opener(),
+        &output.writer,
+        strategy,
+    );
+    try std.testing.expectEqualStrings(expected, output.written());
+}
+
+/// Leaves the batch no spare capacity, so the next append must allocate
+fn exhaustBatch(session: *xet.upload.Session, allocator: std.mem.Allocator) void {
+    session.packing.batch.plans.shrinkAndFree(allocator, session.packing.batch.plans.items.len);
+    session.packing.batch.waiting.shrinkAndFree(allocator, session.packing.batch.waiting.items.len);
+}
+
+test "retrying a failed file finish publishes every Xorb the shard names" {
+    const allocator = std.testing.allocator;
+    var fixed = try xet.chunker.Fixed.init(1);
+    const opts = xet.store.PackOptions{
+        .compression = .none,
+        .max_xorb_chunks = 1,
+        .strategy = fixed.strategy(),
+    };
+    const first = "aa";
+    const retried = "bb";
+    const baseline_allocations = blk: {
+        var tracker = support.TrackingAllocator{ .backing = allocator };
+        defer tracker.deinit();
+        var destination = support.MemoryStore{ .allocator = tracker.allocator() };
+        defer destination.deinit();
+        var session = xet.upload.Session.init(tracker.allocator(), destination.store(), .{});
+        defer session.deinit();
+        _ = try session.addFile(1, first, opts);
+        var file: xet.upload.File = undefined;
+        try session.beginFile(&file, 2, opts);
+        try file.write(retried);
+        exhaustBatch(&session, tracker.allocator());
+        const start = tracker.allocation_count;
+        _ = try file.finish();
+        const used = tracker.allocation_count - start;
+        file.deinit();
+        break :blk used;
+    };
+    try std.testing.expect(baseline_allocations > 0);
+
+    // Every way the finish can fail must leave a retry able to publish its Xorbs
+    for (0..baseline_allocations) |offset| {
+        var tracker = support.TrackingAllocator{ .backing = allocator };
+        defer tracker.deinit();
+        {
+            var destination = support.MemoryStore{ .allocator = tracker.allocator() };
+            defer destination.deinit();
+            var session = xet.upload.Session.init(tracker.allocator(), destination.store(), .{});
+            defer session.deinit();
+            _ = try session.addFile(1, first, opts);
+
+            var file: xet.upload.File = undefined;
+            try session.beginFile(&file, 2, opts);
+            try file.write(retried);
+            exhaustBatch(&session, tracker.allocator());
+            tracker.fail_at = tracker.allocation_count + offset;
+            const outcome = file.finish();
+            tracker.fail_at = null;
+            file.deinit();
+            if (outcome) |_| return error.TestUnexpectedFinishSuccess else |_| {}
+
+            // The retry must not inherit Xorb metadata whose store was discarded
+            _ = try session.addFile(2, retried, opts);
+            try uploadAll(&session, &destination);
+            try session.close();
+            try session.finish();
+            try std.testing.expectEqual(@as(usize, 2), session.packing.batch.plans.items.len);
+
+            const expected = [_][]const u8{ first, retried };
+            for (session.packing.batch.plans.items, expected) |plan, input|
+                try reconstructUploaded(
+                    allocator,
+                    &destination,
+                    plan.file.hash,
+                    input,
+                    fixed.strategy(),
+                );
+        }
+        try std.testing.expectEqual(@as(usize, 0), tracker.outstanding());
+        try std.testing.expectEqual(@as(usize, 0), tracker.duplicate_frees);
+        try std.testing.expectEqual(@as(usize, 0), tracker.invalid_frees);
+    }
+}
+
+test "upload abandons a file that flushed a shared Xorb mid-write" {
+    const allocator = std.testing.allocator;
+    var tracker = support.TrackingAllocator{ .backing = allocator };
+    defer tracker.deinit();
+    var fixed = try xet.chunker.Fixed.init(2);
+    const opts = xet.store.PackOptions{
+        .compression = .none,
+        .max_xorb_chunks = 1,
+        .strategy = fixed.strategy(),
+    };
+    const block = @as([2 * chunks_per_file]u8, @splat('b'));
+    {
+        var destination = support.MemoryStore{ .allocator = tracker.allocator() };
+        defer destination.deinit();
+        var session = xet.upload.Session.init(tracker.allocator(), destination.store(), .{});
+        defer session.deinit();
+        // File one leaves its only chunk buffered in the open Xorb
+        _ = try session.addFile(1, "shared payload", .{ .compression = .none });
+        try std.testing.expectEqual(@as(usize, 0), session.pending());
+
+        var file: xet.upload.File = undefined;
+        try session.beginFile(&file, 2, opts);
+        try file.write(&block);
+        // Overflowing the dedup window flushed the Xorb holding file one's chunk
+        try std.testing.expect(session.pending() > 0);
+        file.deinit();
+
+        // Only file one's plan survives, and its Xorb is already stored
+        try std.testing.expectEqual(@as(usize, 1), session.pending());
+        try uploadAll(&session, &destination);
+        try session.close();
+        try session.finish();
+        try std.testing.expectEqual(@as(usize, 1), destination.count(.xorb));
+        try std.testing.expectEqual(@as(usize, 1), destination.count(.shard));
+        try std.testing.expectEqual(@as(usize, 1), session.packing.batch.plans.items.len);
+
+        const shard_bytes = destination.objects.items[destination.objects.items.len - 1].data;
+        var manifest = try xet.recon.planFromShard(
+            allocator,
+            shard_bytes,
+            session.packing.batch.plans.items[0].file.hash,
+        );
+        defer manifest.deinit(allocator);
+        var opener = StoreOpener{ .store = &destination };
+        const output = try xet.recon.reconstruct(allocator, &manifest.plan, opener.opener());
+        defer allocator.free(output);
+        try std.testing.expectEqualStrings("shared payload", output);
+    }
+    try std.testing.expectEqual(@as(usize, 0), tracker.outstanding());
+    try std.testing.expectEqual(@as(usize, 0), tracker.duplicate_frees);
+    try std.testing.expectEqual(@as(usize, 0), tracker.invalid_frees);
+}
+
+test "a failed final Xorb write leaves nothing publishable" {
+    const allocator = std.testing.allocator;
+    var destination = support.MemoryStore{ .allocator = allocator };
+    defer destination.deinit();
+    var session = xet.upload.Session.init(allocator, destination.store(), .{});
+    defer session.deinit();
+    errdefer discardUpload(&session) catch {};
+    // File A's only chunk stays buffered until the session closes it
+    _ = try session.addFile(1, "alpha", .{ .compression = .none });
+    try std.testing.expectEqual(@as(usize, 0), session.pending());
+    try session.close();
+
+    // The final Xorb is the caller's work, so its write failure is the caller's too
+    destination.fail_on_put = destination.puts;
+    var issued = Issued{ .operation = session.next().? };
+    try std.testing.expectError(
+        error.InjectedStoreFailure,
+        destination.store().put(issued.operation.work.store),
+    );
+    issued.release();
+    try std.testing.expectError(error.OperationFailed, session.finish());
+    try std.testing.expectEqual(@as(usize, 0), destination.count(.xorb));
+    try std.testing.expectEqual(@as(usize, 0), destination.count(.shard));
+}
+
+fn runCommittedFlushFailure(offset: ?usize) !usize {
+    const allocator = std.testing.allocator;
+    const inputs = [_][]const u8{ "alpha", "b" };
+    var tracker = support.TrackingAllocator{ .backing = allocator };
+    defer tracker.deinit();
+    var fixed = try xet.chunker.Fixed.init(1);
+    var allocations: usize = 0;
+    {
+        var destination = support.MemoryStore{ .allocator = tracker.allocator() };
+        defer destination.deinit();
+        var session = xet.upload.Session.init(tracker.allocator(), destination.store(), .{});
+        defer session.deinit();
+        errdefer discardUpload(&session) catch {};
+        _ = try session.addFile(1, inputs[0], .{ .compression = .none });
+        var file: xet.upload.File = undefined;
+        try session.beginFile(&file, 2, .{
+            .compression = .none,
+            .max_xorb_chunks = 1,
+            .strategy = fixed.strategy(),
+        });
+        var retain = true;
+        defer if (retain) file.deinit();
+        try file.write(inputs[1]);
+        // Finalizing the second file flushes the Xorb that holds file one's chunk
+        const start = tracker.allocation_count;
+        if (offset) |value| tracker.fail_at = start + value;
+        if (file.finish()) |_| {} else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+        retain = false;
+        allocations = tracker.allocation_count - start;
+        tracker.fail_at = null;
+        file.deinit();
+
+        // A lost flush makes close terminal, so the drain cannot start
+        uploadAll(&session, &destination) catch |err| switch (err) {
+            error.OperationFailed => {},
+            else => return err,
+        };
+        session.finish() catch |err| {
+            try std.testing.expectEqual(error.OperationFailed, err);
+            try std.testing.expectEqual(@as(usize, 0), destination.count(.shard));
+            try discardUpload(&session);
+            return allocations;
+        };
+
+        // Any published shard must resolve every term and reconstruct its file
+        const plans = session.packing.batch.plans.items;
+        try std.testing.expect(plans.len != 0 and plans.len <= inputs.len);
+        const shard_bytes = destination.objects.items[destination.objects.items.len - 1].data;
+        const reader = try xet.shard.Reader.init(shard_bytes);
+        for (plans, 0..) |plan, index| {
+            const segment = try (try reader.findFile(plan.file.hash)).?.segment(0);
+            try std.testing.expect(!xet.hash.eql(segment.xorb_hash, xet.hash.zero));
+            var manifest = try xet.recon.planFromShard(allocator, shard_bytes, plan.file.hash);
+            defer manifest.deinit(allocator);
+            var opener = StoreOpener{ .store = &destination };
+            const output = try xet.recon.reconstruct(allocator, &manifest.plan, opener.opener());
+            defer allocator.free(output);
+            try std.testing.expectEqualStrings(inputs[index], output);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), tracker.outstanding());
+    try std.testing.expectEqual(@as(usize, 0), tracker.duplicate_frees);
+    try std.testing.expectEqual(@as(usize, 0), tracker.invalid_frees);
+    return allocations;
+}
+
+test "a failed flush of a committed Xorb never publishes unresolved metadata" {
+    const allocations = try runCommittedFlushFailure(null);
+    try std.testing.expect(allocations > 0);
+    for (0..allocations) |offset| _ = try runCommittedFlushFailure(offset);
+}
+
 test "upload queue storage follows outstanding work" {
     const allocator = std.testing.allocator;
-    var fixed = try xet.Fixed.init(1);
-    const opts = xet.PackOptions{
+    var fixed = try xet.chunker.Fixed.init(1);
+    const opts = xet.store.PackOptions{
         .compression = .none,
         .max_xorb_chunks = 1,
         .strategy = fixed.strategy(),
@@ -608,9 +1497,11 @@ test "upload queue storage follows outstanding work" {
         for (&input, 0..) |*byte, offset| byte.* = @truncate('a' + (i + offset) % 26);
         try file.write(&input);
         while (session.pending() > 1) {
-            var issued = Issued{ .operation = (try session.next()).? };
+            var issued = Issued{ .operation = session.next().? };
             defer issued.release();
-            if (issued.operation == .store) try destination.store().put(issued.operation.store.value);
+            if (issued.operation.work == .store) try destination.store().put(
+                issued.operation.work.store,
+            );
             issued.complete();
             emitted += 1;
         }
@@ -622,13 +1513,16 @@ test "upload queue storage follows outstanding work" {
     try std.testing.expect(peak_len <= 8);
     try std.testing.expect(peak_capacity <= 32);
 
-    try file.finish();
-    while (try session.next()) |operation_value| {
+    _ = try file.finish();
+    while (session.next()) |operation_value| {
         var issued = Issued{ .operation = operation_value };
         defer issued.release();
-        if (issued.operation == .store) try destination.store().put(issued.operation.store.value);
+        if (issued.operation.work == .store) try destination.store().put(
+            issued.operation.work.store,
+        );
         issued.complete();
     }
+    try session.close();
     try session.finish();
 }
 
@@ -636,8 +1530,8 @@ test "upload rollback keeps an issued operation usable" {
     const allocator = std.testing.allocator;
     var tracker = support.TrackingAllocator{ .backing = allocator };
     defer tracker.deinit();
-    var fixed = try xet.Fixed.init(2);
-    const opts = xet.PackOptions{
+    var fixed = try xet.chunker.Fixed.init(2);
+    const opts = xet.store.PackOptions{
         .compression = .none,
         .max_xorb_chunks = 1,
         .strategy = fixed.strategy(),
@@ -648,25 +1542,24 @@ test "upload rollback keeps an issued operation usable" {
         defer destination.deinit();
         var session = xet.upload.Session.init(tracker.allocator(), destination.store(), .{});
         defer session.deinit();
-        try session.addFile(1, "aa", opts);
-        var early = Issued{ .operation = (try session.next()).? };
+        _ = try session.addFile(1, "aa", opts);
+        var early = Issued{ .operation = session.next().? };
         defer early.release();
-        try std.testing.expectEqual(@as(xet.upload.FileId, 1), early.operation.store.file_id);
 
         var file: xet.upload.File = undefined;
         try session.beginFile(&file, 2, opts);
         try file.write(&abandoned);
-        var late = Issued{ .operation = (try session.next()).? };
+        var late = Issued{ .operation = session.next().? };
         defer late.release();
-        try std.testing.expectEqual(@as(xet.upload.FileId, 2), late.operation.store.file_id);
         file.deinit();
         try std.testing.expectEqual(@as(usize, 2), session.pending());
 
-        try destination.store().put(late.operation.store.value);
+        try destination.store().put(late.operation.work.store);
         late.complete();
-        try destination.store().put(early.operation.store.value);
+        try destination.store().put(early.operation.work.store);
         early.complete();
-        try std.testing.expect((try session.next()) == null);
+        try std.testing.expect(session.next() == null);
+        try session.close();
         try session.finish();
 
         try std.testing.expectEqual(@as(usize, 1), destination.count(.shard));
@@ -701,8 +1594,8 @@ test "upload completions can run concurrently after file finalization" {
     };
     const Task = struct {
         fn run(destination: *Destination, operation: *xet.upload.Operation) void {
-            std.debug.assert(operation.* == .store);
-            Destination.put(destination, operation.store.value) catch {
+            std.debug.assert(operation.work == .store);
+            Destination.put(destination, operation.work.store) catch {
                 operation.deinit();
                 return;
             };
@@ -714,10 +1607,12 @@ test "upload completions can run concurrently after file finalization" {
     var session = xet.upload.Session.init(allocator, destination.store.store(), .{});
     defer session.deinit();
     errdefer discardUpload(&session) catch {};
-    try session.addFile(1, "first independent payload", .{ .compression = .none });
-    try session.addFile(2, "second independent payload", .{ .compression = .none });
-    var first = (try session.next()).?;
-    var second = (try session.next()).?;
+    // One-chunk Xorbs close after every chunk, so each file emits its own store
+    const opts = xet.store.PackOptions{ .compression = .none, .max_xorb_chunks = 1 };
+    _ = try session.addFile(1, "first independent payload", opts);
+    _ = try session.addFile(2, "second independent payload", opts);
+    var first = session.next().?;
+    var second = session.next().?;
     var first_pending = true;
     var second_pending = true;
     defer if (first_pending) first.deinit();
@@ -755,6 +1650,7 @@ test "upload completions can run concurrently after file finalization" {
     second_running = false;
     first_pending = false;
     second_pending = false;
+    try session.close();
     try session.finish();
     try std.testing.expectEqual(@as(usize, 2), destination.store.count(.xorb));
     try std.testing.expectEqual(@as(usize, 0), session.pending());
@@ -762,7 +1658,7 @@ test "upload completions can run concurrently after file finalization" {
 
 const Fixture = struct {
     object: xet.xorb.Serialized,
-    manifest: xet.reconstruction.ShardPlan,
+    manifest: xet.recon.ShardPlan,
 
     fn init(allocator: std.mem.Allocator, inputs: []const []const u8) !Fixture {
         const chunks = try allocator.alloc(xet.xorb.Chunk, inputs.len);
@@ -795,7 +1691,7 @@ const Fixture = struct {
         defer allocator.free(bytes);
         return .{
             .object = object,
-            .manifest = try xet.reconstruction.planFromShard(allocator, bytes, file_hash),
+            .manifest = try xet.recon.planFromShard(allocator, bytes, file_hash),
         };
     }
 
@@ -817,10 +1713,15 @@ const MemoryBase = struct {
     }
 };
 
-fn decodeFetch(allocator: std.mem.Allocator, fixture: *const Fixture, fetch: *xet.delta.Fetch, output: *std.Io.Writer) !void {
+fn decodeFetch(
+    allocator: std.mem.Allocator,
+    fixture: *const Fixture,
+    fetch: *xet.delta.Fetch,
+    output: *std.Io.Writer,
+) !void {
     var reader: std.Io.Reader = .fixed(fixture.object.bytes);
     var plan = fetch.plan();
-    _ = try xet.reconstruction.decodeOpenedTermVerified(
+    _ = try xet.recon.decodeOpenedTermVerified(
         allocator,
         &plan,
         &reader,
@@ -865,6 +1766,70 @@ test "download cursor mixes memory copies and verified fetched ranges" {
     try std.testing.expectEqualStrings("alphabetagamma", output.written());
 }
 
+test "download cursor serves a fully cached file without remote locations" {
+    const allocator = std.testing.allocator;
+    const hash = xet.hash.data("object");
+    var terms = [_]xet.recon.Term{.{
+        .hash = hash,
+        .unpacked_length = 3,
+        .range = .{ .start = 0, .end = 2 },
+    }};
+    const expected = [_]xet.recon.ExpectedChunk{
+        .{ .hash = xet.hash.data("a"), .size = 1 },
+        .{ .hash = xet.hash.data("bb"), .size = 2 },
+    };
+    const plan = xet.recon.Plan{ .terms = &terms, .locations = &.{} };
+    var base = MemoryBase{ .bytes = "abb" };
+    var cursor = try xet.delta.Cursor.init(
+        allocator,
+        &plan,
+        &expected,
+        .{ .context = &base, .match_fn = MemoryBase.match },
+    );
+    defer cursor.deinit();
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var copies: usize = 0;
+    while (try cursor.next()) |operation_value| {
+        var operation = operation_value;
+        defer operation.deinit();
+        try std.testing.expect(operation == .copy);
+        const bytes: [*]const u8 = @ptrCast(operation.copy.source.context);
+        try output.writer.writeAll(bytes[0..operation.copy.target.size]);
+        copies += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), copies);
+    try std.testing.expectEqualStrings("abb", output.written());
+    try std.testing.expectEqual(@as(u64, 3), cursor.size);
+}
+
+test "download cursor reports a missing location only for an emitted fetch" {
+    const allocator = std.testing.allocator;
+    const hash = xet.hash.data("object");
+    var terms = [_]xet.recon.Term{.{
+        .hash = hash,
+        .unpacked_length = 2,
+        .range = .{ .start = 0, .end = 2 },
+    }};
+    const expected = [_]xet.recon.ExpectedChunk{
+        .{ .hash = xet.hash.data("a"), .size = 1 },
+        .{ .hash = xet.hash.data("b"), .size = 1 },
+    };
+    const plan = xet.recon.Plan{ .terms = &terms, .locations = &.{} };
+    var base = MemoryBase{ .bytes = "a" };
+    var cursor = try xet.delta.Cursor.init(
+        allocator,
+        &plan,
+        &expected,
+        .{ .context = &base, .match_fn = MemoryBase.match },
+    );
+    defer cursor.deinit();
+    var operation = (try cursor.next()).?;
+    defer operation.deinit();
+    try std.testing.expect(operation == .copy);
+    try std.testing.expectError(error.MissingLocation, cursor.next());
+}
+
 /// Serves exactly the requested inclusive byte range of a serialized xorb
 const RangeOpener = struct {
     bytes: []const u8,
@@ -879,7 +1844,10 @@ const RangeOpener = struct {
 
     fn open(raw: *anyopaque, request: xet.stream.Request) !*std.Io.Reader {
         const self: *RangeOpener = @ptrCast(@alignCast(raw));
-        const range = request.byte_range orelse xet.stream.ByteRange{ .start = 0, .end = self.bytes.len - 1 };
+        const range = request.byte_range orelse xet.stream.ByteRange{
+            .start = 0,
+            .end = self.bytes.len - 1,
+        };
         if (range.start > range.end or range.end >= self.bytes.len) return error.InvalidRange;
         self.opens += 1;
         const start: usize = @intCast(range.start);
@@ -888,7 +1856,12 @@ const RangeOpener = struct {
     }
 };
 
-fn fetchWith(allocator: std.mem.Allocator, fetch: *xet.delta.Fetch, sources: *RangeOpener, output: *std.Io.Writer) !void {
+fn fetchWith(
+    allocator: std.mem.Allocator,
+    fetch: *xet.delta.Fetch,
+    sources: *RangeOpener,
+    output: *std.Io.Writer,
+) !void {
     const location = fetch.locations[0];
     const source = try sources.opener().open(.{
         .hash = location.hash,
@@ -897,7 +1870,7 @@ fn fetchWith(allocator: std.mem.Allocator, fetch: *xet.delta.Fetch, sources: *Ra
     });
     defer sources.opener().close(source);
     var plan = fetch.plan();
-    _ = try xet.reconstruction.decodeOpenedTermVerified(
+    _ = try xet.recon.decodeOpenedTermVerified(
         allocator,
         &plan,
         source,
@@ -915,13 +1888,13 @@ test "download cursor narrows the term before selecting a transport location" {
     };
     var object = try xet.xorb.serialize(allocator, &chunks, .none);
     defer object.deinit(allocator);
-    const terms = [_]xet.reconstruction.Term{.{
+    const terms = [_]xet.recon.Term{.{
         .hash = object.hash,
         .unpacked_length = 6,
         .range = .{ .start = 0, .end = 3 },
     }};
     // Each uncompressed record is an 8-byte header plus its payload
-    const locations = [_]xet.reconstruction.Location{
+    const locations = [_]xet.recon.Location{
         .{
             .hash = object.hash,
             .range = .{ .start = 0, .end = 3 },
@@ -935,9 +1908,9 @@ test "download cursor narrows the term before selecting a transport location" {
             .byte_range = .{ .start = 10, .end = 19 },
         },
     };
-    var plan = try xet.reconstruction.Plan.init(allocator, &terms, &locations);
+    var plan = try xet.recon.Plan.init(allocator, &terms, &locations);
     defer plan.deinit(allocator);
-    const expected = [_]xet.reconstruction.ExpectedChunk{
+    const expected = [_]xet.recon.ExpectedChunk{
         .{ .hash = xet.hash.data("aa"), .size = 2 },
         .{ .hash = xet.hash.data("bb"), .size = 2 },
         .{ .hash = xet.hash.data("cc"), .size = 2 },
@@ -989,31 +1962,31 @@ test "download cursor picks a packed range over a whole-object fallback" {
     };
     var object = try xet.xorb.serialize(allocator, &chunks, .none);
     defer object.deinit(allocator);
-    const terms = [_]xet.reconstruction.Term{.{
+    const terms = [_]xet.recon.Term{.{
         .hash = object.hash,
         .unpacked_length = 6,
         .range = .{ .start = 0, .end = 3 },
     }};
-    const whole = xet.reconstruction.Location{
+    const whole = xet.recon.Location{
         .hash = object.hash,
         .range = .{ .start = 1, .end = 2 },
         .url = "memory://whole",
         .byte_range = null,
     };
-    const bounded = xet.reconstruction.Location{
+    const bounded = xet.recon.Location{
         .hash = object.hash,
         .range = .{ .start = 0, .end = 3 },
         .url = "memory://broad",
         .byte_range = .{ .start = 0, .end = @intCast(object.bytes.len - 1) },
     };
-    const orders = [_][2]xet.reconstruction.Location{
+    const orders = [_][2]xet.recon.Location{
         .{ bounded, whole },
         .{ whole, bounded },
     };
     for (orders) |locations| {
-        var plan = try xet.reconstruction.Plan.init(allocator, &terms, &locations);
+        var plan = try xet.recon.Plan.init(allocator, &terms, &locations);
         defer plan.deinit(allocator);
-        const expected = [_]xet.reconstruction.ExpectedChunk{
+        const expected = [_]xet.recon.ExpectedChunk{
             .{ .hash = xet.hash.data("aa"), .size = 2 },
             .{ .hash = xet.hash.data("bb"), .size = 2 },
             .{ .hash = xet.hash.data("cc"), .size = 2 },
@@ -1066,19 +2039,19 @@ test "download cursor tracks the term as it advances through later terms" {
     };
     var object = try xet.xorb.serialize(allocator, &chunks, .none);
     defer object.deinit(allocator);
-    const terms = [_]xet.reconstruction.Term{
+    const terms = [_]xet.recon.Term{
         .{ .hash = object.hash, .unpacked_length = 2, .range = .{ .start = 0, .end = 1 } },
         .{ .hash = object.hash, .unpacked_length = 6, .range = .{ .start = 1, .end = 4 } },
     };
-    const locations = [_]xet.reconstruction.Location{.{
+    const locations = [_]xet.recon.Location{.{
         .hash = object.hash,
         .range = .{ .start = 0, .end = 4 },
         .url = "memory://object",
         .byte_range = .{ .start = 0, .end = @intCast(object.bytes.len - 1) },
     }};
-    var plan = try xet.reconstruction.Plan.init(allocator, &terms, &locations);
+    var plan = try xet.recon.Plan.init(allocator, &terms, &locations);
     defer plan.deinit(allocator);
-    const expected = [_]xet.reconstruction.ExpectedChunk{
+    const expected = [_]xet.recon.ExpectedChunk{
         .{ .hash = xet.hash.data("aa"), .size = 2 },
         .{ .hash = xet.hash.data("bb"), .size = 2 },
         .{ .hash = xet.hash.data("cc"), .size = 2 },
@@ -1092,7 +2065,7 @@ test "download cursor tracks the term as it advances through later terms" {
         .{ .context = &base, .match_fn = MemoryBase.match },
     );
     defer cursor.deinit();
-    var ranges: [2]xet.reconstruction.Range = undefined;
+    var ranges: [2]xet.recon.Range = undefined;
     var fetches: usize = 0;
     while (try cursor.next()) |operation_value| {
         var operation = operation_value;
@@ -1116,7 +2089,12 @@ test "download fetch operations can write a positional file" {
     defer tmp.cleanup();
     var file = try tmp.dir.createFile(std.testing.io, "output", .{ .read = true });
     defer file.close(std.testing.io);
-    var cursor = try xet.delta.Cursor.init(allocator, &fixture.manifest.plan, fixture.manifest.chunks, null);
+    var cursor = try xet.delta.Cursor.init(
+        allocator,
+        &fixture.manifest.plan,
+        fixture.manifest.chunks,
+        null,
+    );
     defer cursor.deinit();
     while (try cursor.next()) |operation_value| {
         var operation = operation_value;
@@ -1167,7 +2145,12 @@ test "download operations retain base handles after cursor destruction" {
     var fixture = try Fixture.init(allocator, &.{ "aa", "bbb", "cc" });
     defer fixture.deinit(allocator);
     var base = OwnedBase{ .matches = &.{ true, false, true } };
-    var cursor = try xet.delta.Cursor.init(allocator, &fixture.manifest.plan, fixture.manifest.chunks, base.base());
+    var cursor = try xet.delta.Cursor.init(
+        allocator,
+        &fixture.manifest.plan,
+        fixture.manifest.chunks,
+        base.base(),
+    );
     var issued = (try cursor.next()).?;
     var pending = true;
     defer if (pending) issued.deinit();
@@ -1223,7 +2206,12 @@ test "cursor retries a failed lookahead without skipping chunks" {
     var fixture = try Fixture.init(allocator, &.{ "aa", "bb", "cc" });
     defer fixture.deinit(allocator);
     var base = FlakyBase{};
-    var cursor = try xet.delta.Cursor.init(allocator, &fixture.manifest.plan, fixture.manifest.chunks, base.base());
+    var cursor = try xet.delta.Cursor.init(
+        allocator,
+        &fixture.manifest.plan,
+        fixture.manifest.chunks,
+        base.base(),
+    );
     defer cursor.deinit();
     var covered: u64 = 0;
     var copies: usize = 0;
@@ -1269,7 +2257,12 @@ test "cursor deinit after a failed lookahead keeps handles single-owner" {
     var fixture = try Fixture.init(allocator, &.{ "aa", "bb", "cc" });
     defer fixture.deinit(allocator);
     var base = FlakyBase{ .match_zero = true };
-    var cursor = try xet.delta.Cursor.init(allocator, &fixture.manifest.plan, fixture.manifest.chunks, base.base());
+    var cursor = try xet.delta.Cursor.init(
+        allocator,
+        &fixture.manifest.plan,
+        fixture.manifest.chunks,
+        base.base(),
+    );
     var operation = (try cursor.next()).?;
     try std.testing.expect(operation == .copy);
     try std.testing.expectEqual(@as(u64, 0), operation.copy.target.offset);
@@ -1287,7 +2280,12 @@ test "cursor deinit after a failed first probe releases nothing" {
     var fixture = try Fixture.init(allocator, &.{ "aa", "bb" });
     defer fixture.deinit(allocator);
     var base = FlakyBase{};
-    var cursor = try xet.delta.Cursor.init(allocator, &fixture.manifest.plan, fixture.manifest.chunks, base.base());
+    var cursor = try xet.delta.Cursor.init(
+        allocator,
+        &fixture.manifest.plan,
+        fixture.manifest.chunks,
+        base.base(),
+    );
     try std.testing.expectError(error.InjectedFailure, cursor.next());
     cursor.deinit();
     try std.testing.expectEqual(@as(usize, 0), base.created);
@@ -1296,24 +2294,24 @@ test "cursor deinit after a failed first probe releases nothing" {
 
 /// One term of two one-byte chunks with a whole-object location
 const TwoChunkPlan = struct {
-    plan: xet.reconstruction.Plan,
-    chunks: [2]xet.reconstruction.ExpectedChunk,
+    plan: xet.recon.Plan,
+    chunks: [2]xet.recon.ExpectedChunk,
 
     fn init(allocator: std.mem.Allocator) !TwoChunkPlan {
         const hash = xet.hash.data("object");
-        const terms = [_]xet.reconstruction.Term{.{
+        const terms = [_]xet.recon.Term{.{
             .hash = hash,
             .unpacked_length = 2,
             .range = .{ .start = 0, .end = 2 },
         }};
-        const locations = [_]xet.reconstruction.Location{.{
+        const locations = [_]xet.recon.Location{.{
             .hash = hash,
             .range = .{ .start = 0, .end = 2 },
             .url = "memory://object",
             .byte_range = null,
         }};
         return .{
-            .plan = try xet.reconstruction.Plan.init(allocator, &terms, &locations),
+            .plan = try xet.recon.Plan.init(allocator, &terms, &locations),
             .chunks = .{
                 .{ .hash = xet.hash.data("a"), .size = 1 },
                 .{ .hash = xet.hash.data("b"), .size = 1 },
@@ -1396,13 +2394,13 @@ test "cursor retries after a locator allocation failure and releases each handle
 }
 
 test "delta target validation rejects inverted term ranges" {
-    var terms = [_]xet.reconstruction.Term{.{
+    var terms = [_]xet.recon.Term{.{
         .hash = xet.hash.zero,
         .unpacked_length = 2,
         .range = .{ .start = 2, .end = 1 },
     }};
-    var plan = xet.reconstruction.Plan{ .terms = &terms, .locations = &.{} };
-    const chunks = [_]xet.reconstruction.ExpectedChunk{.{
+    var plan = xet.recon.Plan{ .terms = &terms, .locations = &.{} };
+    const chunks = [_]xet.recon.ExpectedChunk{.{
         .hash = xet.hash.data("AA"),
         .size = 2,
     }};

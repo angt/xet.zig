@@ -1,4 +1,4 @@
-//! MDB shard V2 files: reconstruction records and lookup tables
+//! MDB shard V2 files: recon records and lookup tables
 
 const std = @import("std");
 const hashing = @import("hash.zig");
@@ -206,7 +206,10 @@ pub fn serialize(
     defer xorb_section.deinit(allocator);
     var chunk_position: usize = 0;
     for (xorbs, xorb_locations) |object, *location| {
-        location.* = .{ .hash = object.hash, .index = @intCast(xorb_section.items.len / entry_size) };
+        location.* = .{
+            .hash = object.hash,
+            .index = @intCast(xorb_section.items.len / entry_size),
+        };
         for (object.chunks, 0..) |chunk, index| {
             chunk_locations[chunk_position] = .{
                 .hash = chunk.hash,
@@ -380,7 +383,12 @@ pub const Reader = struct {
             return null;
         }
         const needle = hashing.truncated(hash);
-        var index = try self.lowerBound(self.footer.file_lookup_offset, self.footer.file_count, 12, needle);
+        var index = try self.lowerBound(
+            self.footer.file_lookup_offset,
+            self.footer.file_count,
+            12,
+            needle,
+        );
         while (index < self.footer.file_count) : (index += 1) {
             const offset = self.footer.file_lookup_offset + 12 * index;
             if (try readU64(self.data, offset) != needle) break;
@@ -402,7 +410,12 @@ pub const Reader = struct {
             return null;
         }
         const needle = hashing.truncated(hash);
-        var index = try self.lowerBound(self.footer.xorb_lookup_offset, self.footer.xorb_count, 12, needle);
+        var index = try self.lowerBound(
+            self.footer.xorb_lookup_offset,
+            self.footer.xorb_count,
+            12,
+            needle,
+        );
         while (index < self.footer.xorb_count) : (index += 1) {
             const offset = self.footer.xorb_lookup_offset + 12 * index;
             if (try readU64(self.data, offset) != needle) break;
@@ -429,7 +442,10 @@ pub const Reader = struct {
         var high = count;
         while (low < high) {
             const middle = low + (high - low) / 2;
-            if (try readU64(self.data, start + stride * middle) < needle) low = middle + 1 else high = middle;
+            if (try readU64(
+                self.data,
+                start + stride * middle,
+            ) < needle) low = middle + 1 else high = middle;
         }
         return low;
     }
@@ -446,7 +462,14 @@ pub const Reader = struct {
         const entry_count = @as(u64, count) * (1 + has_verification) + has_metadata;
         const end = try offsetAfter(offset + entry_size, try castUsize(entry_count), entry_size);
         if (end > self.footer.xorb_info_offset) return error.InvalidCounts;
-        return .{ .reader = self, .offset = offset, .end = end, .hash = hash, .flags = flags, .count = count };
+        return .{
+            .reader = self,
+            .offset = offset,
+            .end = end,
+            .hash = hash,
+            .flags = flags,
+            .count = count,
+        };
     }
 
     pub fn xorbAt(self: Reader, index: u32) !XorbInfo {
@@ -577,7 +600,10 @@ pub const FileInfo = struct {
 
     pub fn verification(self: FileInfo, index: u32) !hashing.Hash {
         if (self.flags & verification_flag == 0 or index >= self.count) return error.InvalidRange;
-        return readHash(self.reader.data, self.offset + entry_size * (@as(usize, self.count + index) + 1));
+        return readHash(
+            self.reader.data,
+            self.offset + entry_size * (@as(usize, self.count + index) + 1),
+        );
     }
 
     pub fn sha256(self: FileInfo) !?hashing.Hash {
@@ -738,7 +764,11 @@ test "identical duplicate xorbs coalesce but conflicting duplicates fail" {
     try std.testing.expectEqual(@as(usize, 1), reader.footer.xorb_count);
     var conflicting = object;
     conflicting.serialized_size += 1;
-    try std.testing.expectError(error.InvalidCounts, serialize(allocator, &.{}, &.{ object, conflicting }));
+    try std.testing.expectError(error.InvalidCounts, serialize(
+        allocator,
+        &.{},
+        &.{ object, conflicting },
+    ));
 }
 
 test "shard rejects malformed counts and offsets" {

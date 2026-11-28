@@ -1,6 +1,7 @@
 //! Xorb chunk streams and V1 object footers
 
 const std = @import("std");
+const chunker = @import("chunker.zig");
 const constants = @import("constants.zig");
 const hashing = @import("hash.zig");
 const lz4 = @import("lz4.zig");
@@ -13,10 +14,7 @@ pub const Compression = enum(u8) {
     bg4_lz4 = 2,
 };
 
-pub const Chunk = struct {
-    data: []const u8,
-    hash: hashing.Hash,
-};
+pub const Chunk = chunker.Chunk;
 
 /// Target chunk metadata that a decoded stream must reproduce exactly
 pub const ExpectedChunk = struct {
@@ -113,20 +111,21 @@ fn compressChunk(
     errdefer output.shrinkRetainingCapacity(frame_start);
     try output.appendNTimes(allocator, 0, 8);
     const payload_start = output.items.len;
-    if (compression != .none) {
+    const compressed = if (compression != .none) compressed: {
         const source = if (compression == .bg4_lz4) source: {
             try transformed.resize(allocator, input.len);
             group4(input, transformed.items);
             break :source transformed.items;
         } else input;
-        try lz4.compressInto(allocator, source, output, scratch orelse unreachable);
-    }
-    const actual = if (compression == .none or output.items.len - payload_start >= input.len)
-        Compression.none
-    else
-        compression;
-    if (actual == .none) {
-        output.shrinkRetainingCapacity(payload_start);
+        break :compressed try lz4.compressIfSmaller(
+            allocator,
+            source,
+            output,
+            scratch orelse unreachable,
+        );
+    } else false;
+    const actual = if (compressed) compression else Compression.none;
+    if (!compressed) {
         try output.appendSlice(allocator, input);
     }
     const payload_length = output.items.len - payload_start;
@@ -414,7 +413,20 @@ pub fn decodeStreamSized(
     expected: ?[]const ExpectedChunk,
     sink: *std.Io.Writer,
 ) !u64 {
+    return decodeFrames(allocator, source, start, end, expected, sink, null);
+}
+
+pub fn decodeFrames(
+    allocator: std.mem.Allocator,
+    source: *std.Io.Reader,
+    start: u32,
+    end: u32,
+    expected: ?[]const ExpectedChunk,
+    sink: *std.Io.Writer,
+    frames: ?[]hashing.Node,
+) !u64 {
     if (start >= end) return error.InvalidRange;
+    if (frames) |nodes| if (nodes.len != end - start) return error.SizeMismatch;
     if (expected) |chunks| {
         if (chunks.len != end - start) return error.SizeMismatch;
     }
@@ -440,33 +452,52 @@ pub fn decodeStreamSized(
             if (raw_size != @as(usize, chunks[index - start].size)) return error.SizeMismatch;
         }
 
+        if (frames) |nodes| nodes[index - start].size = raw_size;
         const compression = std.enums.fromInt(Compression, header[4]) orelse
             return error.UnsupportedCompression;
         switch (compression) {
             .none => {
                 if (compressed_size != raw_size) return error.SizeMismatch;
-                var buffer: [stream.scratch_buffer_size]u8 = undefined;
-                var remaining = raw_size;
-                while (remaining != 0) {
-                    const count = @min(remaining, buffer.len);
-                    try readExact(source, buffer[0..count]);
-                    try sink.writeAll(buffer[0..count]);
-                    total += count;
-                    remaining -= count;
+                if (source.bufferedLen() >= raw_size) {
+                    try sink.writeAll(source.buffered()[0..raw_size]);
+                    source.toss(raw_size);
+                } else if (sink.buffer.len - sink.end >= raw_size) {
+                    try readExact(source, sink.buffer[sink.end..][0..raw_size]);
+                    sink.end += raw_size;
+                } else {
+                    try decoded.resize(allocator, raw_size);
+                    try readExact(source, decoded.items);
+                    try sink.writeAll(decoded.items);
                 }
+                total += raw_size;
             },
             .lz4, .bg4_lz4 => {
-                try compressed.resize(allocator, compressed_size);
-                try readExact(source, compressed.items);
-                try decoded.resize(allocator, raw_size);
-                lz4.decompressInto(compressed.items, decoded.items) catch return error.InvalidXorb;
-                if (compression == .lz4) {
-                    try sink.writeAll(decoded.items);
+                const borrowed = source.bufferedLen() >= compressed_size;
+                const payload = if (borrowed)
+                    source.buffered()[0..compressed_size]
+                else payload: {
+                    try compressed.resize(allocator, compressed_size);
+                    try readExact(source, compressed.items);
+                    break :payload compressed.items;
+                };
+                if (compression == .lz4 and sink.buffer.len - sink.end >= raw_size) {
+                    lz4.decompressInto(
+                        payload,
+                        sink.buffer[sink.end..][0..raw_size],
+                    ) catch return error.InvalidXorb;
+                    sink.end += raw_size;
                 } else {
-                    try compressed.resize(allocator, raw_size);
-                    ungroup4(decoded.items, compressed.items);
-                    try sink.writeAll(compressed.items);
+                    try decoded.resize(allocator, raw_size);
+                    lz4.decompressInto(payload, decoded.items) catch return error.InvalidXorb;
+                    if (compression == .lz4) {
+                        try sink.writeAll(decoded.items);
+                    } else {
+                        try compressed.resize(allocator, raw_size);
+                        ungroup4(decoded.items, compressed.items);
+                        try sink.writeAll(compressed.items);
+                    }
                 }
+                if (borrowed) source.toss(compressed_size);
                 total += raw_size;
             },
         }
@@ -614,7 +645,10 @@ test "incremental serialization is identical and retryable after allocation fail
             var serializer: Serializer = .init(compression);
             errdefer serializer.deinit(tracker.allocator());
             if (fail_at < add_allocations) {
-                try std.testing.expectError(error.OutOfMemory, serializer.add(tracker.allocator(), chunk));
+                try std.testing.expectError(
+                    error.OutOfMemory,
+                    serializer.add(tracker.allocator(), chunk),
+                );
                 try std.testing.expectEqual(@as(usize, 0), serializer.output.items.len);
                 try std.testing.expectEqual(@as(usize, 0), serializer.chunks.items.len);
                 try std.testing.expectEqual(@as(usize, 0), serializer.nodes.items.len);
@@ -622,8 +656,15 @@ test "incremental serialization is identical and retryable after allocation fail
                 try serializer.add(tracker.allocator(), chunk);
             } else {
                 try serializer.add(tracker.allocator(), chunk);
-                try std.testing.expectError(error.OutOfMemory, serializer.finish(tracker.allocator()));
-                try std.testing.expectEqualSlices(u8, expected.bytes[0..expected.body_length], serializer.output.items);
+                try std.testing.expectError(
+                    error.OutOfMemory,
+                    serializer.finish(tracker.allocator()),
+                );
+                try std.testing.expectEqualSlices(
+                    u8,
+                    expected.bytes[0..expected.body_length],
+                    serializer.output.items,
+                );
                 try std.testing.expectEqual(@as(usize, 1), serializer.chunks.items.len);
                 try std.testing.expectEqual(@as(usize, 1), serializer.nodes.items.len);
                 try std.testing.expectEqual(@as(usize, 1), serializer.packed_boundaries.items.len);
@@ -695,9 +736,18 @@ test "incremental decoding handles one-byte reads and skipped chunks" {
         const Context = struct {
             bytes: []const u8,
             position: usize = 0,
-            reader: std.Io.Reader = .{ .vtable = &.{ .stream = streamOne }, .buffer = &.{}, .seek = 0, .end = 0 },
+            reader: std.Io.Reader = .{
+                .vtable = &.{ .stream = streamOne },
+                .buffer = &.{},
+                .seek = 0,
+                .end = 0,
+            },
 
-            fn streamOne(reader: *std.Io.Reader, writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            fn streamOne(
+                reader: *std.Io.Reader,
+                writer: *std.Io.Writer,
+                limit: std.Io.Limit,
+            ) std.Io.Reader.StreamError!usize {
                 const self: *@This() = @fieldParentPtr("reader", reader);
                 if (self.position == self.bytes.len or limit == .nothing) return error.EndOfStream;
                 try writer.writeAll(self.bytes[self.position..][0..1]);
@@ -705,7 +755,9 @@ test "incremental decoding handles one-byte reads and skipped chunks" {
                 return 1;
             }
         };
-        var context = Context{ .bytes = object.bytes[0 .. object.bytes.len - footerLength(chunks.len) - 4] };
+        var context = Context{
+            .bytes = object.bytes[0 .. object.bytes.len - footerLength(chunks.len) - 4],
+        };
         var output: std.Io.Writer.Allocating = .init(allocator);
         defer output.deinit();
         const count = try decodeStream(allocator, &context.reader, 1, 3, &output.writer);
@@ -903,7 +955,12 @@ test "xorb decoding rejects an empty requested range" {
     const chunks = [_]Chunk{.{ .data = "chunk", .hash = hashing.data("chunk") }};
     var object = try serialize(std.testing.allocator, &chunks, .none);
     defer object.deinit(std.testing.allocator);
-    try std.testing.expectError(error.InvalidRange, decodeRange(std.testing.allocator, object.bytes, 1, 1));
+    try std.testing.expectError(error.InvalidRange, decodeRange(
+        std.testing.allocator,
+        object.bytes,
+        1,
+        1,
+    ));
 }
 
 test "xorb verification rejects a corrupted footer length" {

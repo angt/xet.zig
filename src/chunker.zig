@@ -84,7 +84,12 @@ pub const Chunker = struct {
     }
 
     /// Set `final` only when no later input belongs to the same file
-    pub fn next(self: *Chunker, allocator: std.mem.Allocator, input: []const u8, final: bool) !Result {
+    pub fn next(
+        self: *Chunker,
+        allocator: std.mem.Allocator,
+        input: []const u8,
+        final: bool,
+    ) !Result {
         if (self.returned_pending) {
             self.pending.clearRetainingCapacity();
             self.returned_pending = false;
@@ -145,11 +150,17 @@ pub const Chunker = struct {
         while (index < warmup_end) : (index += 1) {
             hash = hash +% hash +% constants.gear_table[input[index]];
         }
+        // Unroll independent byte loads while preserving the earliest canonical cut.
+        while (read_end - index >= 4) : (index += 4) {
+            inline for (0..4) |lane| {
+                hash = hash +% hash +% constants.gear_table[input[index + lane]];
+                if (hash & constants.gear_mask == 0) return index + lane + 1;
+            }
+        }
         while (index < read_end) : (index += 1) {
             hash = hash +% hash +% constants.gear_table[input[index]];
             if ((hash & constants.gear_mask) == 0) {
-                self.hash = hash;
-                return @min(index + 1, constants.max_chunk_size - previous_len);
+                return index + 1;
             }
         }
         self.hash = hash;
@@ -345,43 +356,27 @@ test "tiny input produces one complete chunk" {
     try std.testing.expectEqualStrings("hello", tiny[0].data);
 }
 
-/// Returns an owned copy of every chunk produced by `step`-sized writes
-fn streamSteps(
-    allocator: std.mem.Allocator,
-    strategy: Strategy,
-    input: []const u8,
-    step: usize,
-) !std.ArrayList(Chunk) {
-    var streamed: std.ArrayList(Chunk) = .empty;
-    errdefer freeChunks(allocator, &streamed);
+// Compare borrowed chunks while they are valid. No list of payload copies is needed.
+fn checkSteps(strategy: Strategy, input: []const u8, step: usize, expected: []const Chunk) !void {
+    const allocator = std.testing.allocator;
     var current = Chunker.initWith(strategy);
     defer current.deinit(allocator);
-    var position: usize = 0;
-    while (position < input.len) {
-        const end = @min(position + step, input.len);
-        var remaining = input[position..end];
-        while (remaining.len != 0) {
-            const result = try current.next(allocator, remaining, false);
-            try appendCopy(allocator, &streamed, result.chunk);
-            remaining = remaining[result.consumed..];
+    var offset: usize = 0;
+    var index: usize = 0;
+    while (true) {
+        const end = @min(input.len, offset + step);
+        const final = offset == input.len;
+        const result = try current.next(allocator, input[offset..end], final);
+        if (result.chunk) |chunk| {
+            try std.testing.expect(index < expected.len);
+            try std.testing.expectEqualSlices(u8, expected[index].data, chunk.data);
+            try std.testing.expectEqual(expected[index].hash, chunk.hash);
+            index += 1;
         }
-        position = end;
+        offset += result.consumed;
+        if (final) break;
     }
-    try appendCopy(allocator, &streamed, (try current.finish(allocator)).chunk);
-    return streamed;
-}
-
-/// The list owns the copy only once the append succeeds
-fn appendCopy(allocator: std.mem.Allocator, streamed: *std.ArrayList(Chunk), chunk: ?Chunk) !void {
-    const value = chunk orelse return;
-    const copy = try allocator.dupe(u8, value.data);
-    errdefer allocator.free(copy);
-    try streamed.append(allocator, .{ .data = copy, .hash = value.hash });
-}
-
-fn freeChunks(allocator: std.mem.Allocator, streamed: *std.ArrayList(Chunk)) void {
-    for (streamed.items) |chunk| allocator.free(chunk.data);
-    streamed.deinit(allocator);
+    try std.testing.expectEqual(expected.len, index);
 }
 
 test "fixed chunks preserve data across fragmented input" {
@@ -395,13 +390,7 @@ test "fixed chunks preserve data across fragmented input" {
     try std.testing.expectEqualStrings("efgh", contiguous[1].data);
     try std.testing.expectEqualStrings("ij", contiguous[2].data);
 
-    var streamed = try streamSteps(allocator, fixed.strategy(), input, 1);
-    defer freeChunks(allocator, &streamed);
-    try std.testing.expectEqual(contiguous.len, streamed.items.len);
-    for (contiguous, streamed.items) |expected, actual| {
-        try std.testing.expectEqualSlices(u8, expected.data, actual.data);
-        try std.testing.expect(hashing.eql(expected.hash, actual.hash));
-    }
+    try checkSteps(fixed.strategy(), input, 1, contiguous);
 }
 
 /// Rolling hash proving boundaries survive fragmentation and resets
@@ -439,13 +428,7 @@ test "custom rolling hash boundaries agree across input fragmentation" {
     defer allocator.free(expected);
     try std.testing.expect(expected.len > 1);
 
-    var streamed = try streamSteps(allocator, rolling.strategy(), input, 3);
-    defer freeChunks(allocator, &streamed);
-    try std.testing.expectEqual(expected.len, streamed.items.len);
-    for (expected, streamed.items) |expected_chunk, actual| {
-        try std.testing.expectEqualSlices(u8, expected_chunk.data, actual.data);
-        try std.testing.expect(hashing.eql(expected_chunk.hash, actual.hash));
-    }
+    try checkSteps(rolling.strategy(), input, 3, expected);
 }
 
 test "a used strategy context resumes from a clean state on the next file" {
@@ -543,7 +526,10 @@ test "a forced maximum-size cut resets the strategy for the following chunk" {
     try std.testing.expectEqual(@as(usize, 5), chunks[1].data.len);
     try std.testing.expectEqualSlices(u8, input[0..constants.max_chunk_size], chunks[0].data);
     try std.testing.expectEqualSlices(u8, input[constants.max_chunk_size..], chunks[1].data);
-    try std.testing.expect(hashing.eql(chunks[1].hash, hashing.data(input[constants.max_chunk_size..])));
+    try std.testing.expect(hashing.eql(
+        chunks[1].hash,
+        hashing.data(input[constants.max_chunk_size..]),
+    ));
 
     try std.testing.expectEqual(@as(usize, 2), never.starts);
     try std.testing.expectEqual(@as(usize, 0), never.stale_starts);
@@ -557,15 +543,12 @@ test "fragmented input forces one maximum-size cut and flushes the tail once" {
     fillRandom(input, 19);
     var never: NeverCuts = .{};
 
-    var streamed = try streamSteps(allocator, never.strategy(), input, 7);
-    defer freeChunks(allocator, &streamed);
-    try std.testing.expectEqual(@as(usize, 2), streamed.items.len);
-    try std.testing.expectEqual(constants.max_chunk_size, streamed.items[0].data.len);
-    try std.testing.expectEqual(@as(usize, 5), streamed.items[1].data.len);
-    try std.testing.expectEqualSlices(u8, input[0..constants.max_chunk_size], streamed.items[0].data);
-    try std.testing.expectEqualSlices(u8, input[constants.max_chunk_size..], streamed.items[1].data);
-    try std.testing.expect(hashing.eql(streamed.items[0].hash, hashing.data(input[0..constants.max_chunk_size])));
-    try std.testing.expect(hashing.eql(streamed.items[1].hash, hashing.data(input[constants.max_chunk_size..])));
+    const first = input[0..constants.max_chunk_size];
+    const last = input[constants.max_chunk_size..];
+    try checkSteps(never.strategy(), input, 7, &.{
+        .{ .data = first, .hash = hashing.data(first) },
+        .{ .data = last, .hash = hashing.data(last) },
+    });
 
     try std.testing.expectEqual(@as(usize, 2), never.starts);
     try std.testing.expectEqual(@as(usize, 0), never.stale_starts);
@@ -604,74 +587,8 @@ test "an exact multiple of the maximum size emits no trailing empty chunk" {
     try std.testing.expectEqual(@as(usize, 0), never.stale_starts);
 
     // Fragmenting every write at the limit must not add an empty trailing chunk
-    var streamed = try streamSteps(allocator, never.strategy(), input, constants.max_chunk_size);
-    defer freeChunks(allocator, &streamed);
-    try std.testing.expectEqual(@as(usize, 2), streamed.items.len);
-    for (streamed.items) |chunk| try std.testing.expectEqual(constants.max_chunk_size, chunk.data.len);
-    for (chunks, streamed.items) |expected, actual| {
-        try std.testing.expectEqualSlices(u8, expected.data, actual.data);
-        try std.testing.expect(hashing.eql(expected.hash, actual.hash));
-    }
+    try checkSteps(never.strategy(), input, constants.max_chunk_size, chunks);
     try std.testing.expectEqual(@as(usize, 0), never.stale_starts);
-}
-
-test "fragmented copies stay owned across append failures and later errors" {
-    const support = @import("test_support");
-    for ([_]bool{ false, true }) |has_previous| {
-        var tracker: support.TrackingAllocator = .{ .backing = std.testing.allocator };
-        defer tracker.deinit();
-        const allocator = tracker.allocator();
-        var streamed: std.ArrayList(Chunk) = .empty;
-        if (has_previous) {
-            const previous = Chunk{ .data = "first", .hash = hashing.data("first") };
-            try appendCopy(allocator, &streamed, previous);
-            streamed.shrinkAndFree(allocator, streamed.items.len);
-            try std.testing.expectEqual(streamed.items.len, streamed.capacity);
-        }
-        tracker.fail_at = tracker.allocation_count + 1;
-        const next = Chunk{ .data = "second", .hash = hashing.data("second") };
-        try std.testing.expectError(error.OutOfMemory, appendCopy(allocator, &streamed, next));
-        freeChunks(allocator, &streamed);
-        try std.testing.expectEqual(@as(usize, 0), tracker.outstanding());
-        try std.testing.expectEqual(@as(usize, 0), tracker.duplicate_frees);
-        try std.testing.expectEqual(@as(usize, 0), tracker.invalid_frees);
-    }
-}
-
-fn streamStepsAllocates(allocator: std.mem.Allocator) !void {
-    var fixed = try Fixed.init(4);
-    var streamed = try streamSteps(allocator, fixed.strategy(), "abcdefghijkl", 1);
-    defer freeChunks(allocator, &streamed);
-    try std.testing.expectEqual(@as(usize, 3), streamed.items.len);
-    for (streamed.items, [_][]const u8{ "abcd", "efgh", "ijkl" }) |chunk, expected| {
-        try std.testing.expectEqualStrings(expected, chunk.data);
-    }
-}
-
-test "fragmented strategy streaming releases copies on allocation failure" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        streamStepsAllocates,
-        .{},
-    );
-}
-
-fn rollingStepsAllocates(allocator: std.mem.Allocator) !void {
-    const input = "rolling boundaries under failure";
-    var rolling: RollingHash = .{};
-    const expected = try chunkWith(allocator, input, rolling.strategy());
-    defer allocator.free(expected);
-    var streamed = try streamSteps(allocator, rolling.strategy(), input, 3);
-    defer freeChunks(allocator, &streamed);
-    try std.testing.expectEqual(expected.len, streamed.items.len);
-    for (expected, streamed.items) |want, got| try std.testing.expectEqualSlices(u8, want.data, got.data);
-}
-test "rolling strategy streaming releases copies on allocation failure" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        rollingStepsAllocates,
-        .{},
-    );
 }
 
 test "chunk strategies reject invalid boundaries and sizes" {

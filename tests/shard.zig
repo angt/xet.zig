@@ -6,18 +6,18 @@ const SliceOpener = struct {
     bytes: []const u8,
     requests: usize = 0,
     closes: usize = 0,
-    last_range: ?xet.reconstruction.ByteRange = .{ .start = 0, .end = 0 },
+    last_range: ?xet.recon.ByteRange = .{ .start = 0, .end = 0 },
     reader: std.Io.Reader = undefined,
 
     fn opener(self: *SliceOpener) xet.stream.Opener {
         return .{ .context = self, .open_fn = open, .close_fn = close };
     }
 
-    fn open(raw: *anyopaque, request: xet.reconstruction.Request) !*std.Io.Reader {
+    fn open(raw: *anyopaque, request: xet.recon.Request) !*std.Io.Reader {
         const self: *SliceOpener = @ptrCast(@alignCast(raw));
         self.requests += 1;
         self.last_range = request.byte_range;
-        const range = request.byte_range orelse xet.reconstruction.ByteRange{
+        const range = request.byte_range orelse xet.recon.ByteRange{
             .start = 0,
             .end = @intCast(self.bytes.len - 1),
         };
@@ -87,7 +87,7 @@ test "exact 64 MiB footerless shard body publishes successfully" {
     const bytes = try xet.shard.serialize(allocator, &.{terms.file}, &.{});
     defer allocator.free(bytes);
     try std.testing.expectEqual(@as(usize, 67_109_012), bytes.len);
-    var package = xet.Package{
+    var package = xet.store.Package{
         .file_hash = terms.file.hash,
         .size = count,
         .objects = &.{},
@@ -97,9 +97,9 @@ test "exact 64 MiB footerless shard body publishes successfully" {
     var server = try support.Loopback.init(allocator, std.testing.io, &responses);
     defer server.deinit();
     try server.start();
-    var client = try xet.http.Client.init(allocator, std.testing.io, server.origin, "");
+    var client = try xet.Client.init(allocator, std.testing.io, server.origin, "");
     defer client.deinit();
-    try xet.publish(allocator, &package, client.store());
+    try xet.store.publish(allocator, &package, client.store());
     try server.finish();
     try std.testing.expectEqual(@as(usize, 1), server.exchanges.items.len);
     const body = server.exchanges.items[0].body;
@@ -108,7 +108,11 @@ test "exact 64 MiB footerless shard body publishes successfully" {
     for (0..count) |index| {
         const offset = 96 + index * 48;
         try std.testing.expectEqualSlices(u8, &object.hash, body[offset..][0..32]);
-        try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, body[offset + 36 ..][0..4], .little));
+        try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(
+            u32,
+            body[offset + 36 ..][0..4],
+            .little,
+        ));
     }
 }
 
@@ -166,8 +170,12 @@ test "footerless and empty-lookup shards validate and plan with unknown encoded 
         try std.testing.expectEqual(@as(usize, 1), reader.footer.file_count);
         try std.testing.expectEqual(@as(usize, 1), reader.footer.xorb_count);
         try std.testing.expectEqual(body_len, try xet.store.wireShardSize(bytes));
-        try std.testing.expectEqual(file_hash, try xet.reconstruction.validateShardFile(allocator, bytes, file_hash));
-        var manifest = try xet.reconstruction.planFromShard(allocator, bytes, file_hash);
+        try std.testing.expectEqual(file_hash, try xet.recon.validateShardFile(
+            allocator,
+            bytes,
+            file_hash,
+        ));
+        var manifest = try xet.recon.planFromShard(allocator, bytes, file_hash);
         defer manifest.deinit(allocator);
         try std.testing.expectEqual(@as(usize, 1), manifest.plan.terms.len);
         try std.testing.expect(manifest.plan.locations[0].byte_range == null);
@@ -182,7 +190,10 @@ test "unknown encoded length uses transport and verifies nonzero chunk start" {
     };
     var object = try xet.xorb.serialize(allocator, &chunks, .none);
     defer object.deinit(allocator);
-    const file_hash = try xet.hash.file(allocator, &.{.{ .hash = xet.hash.data("BBB"), .size = 3 }});
+    const file_hash = try xet.hash.file(
+        allocator,
+        &.{.{ .hash = xet.hash.data("BBB"), .size = 3 }},
+    );
     const checks = [_]xet.Hash{xet.hash.verification(&.{xet.hash.data("BBB")})};
     const bytes = try xet.shard.serialize(allocator, &.{.{
         .hash = file_hash,
@@ -200,18 +211,21 @@ test "unknown encoded length uses transport and verifies nonzero chunk start" {
         .serialized_size = 0,
     }});
     defer allocator.free(bytes);
-    var manifest = try xet.reconstruction.planFromShard(allocator, bytes, file_hash);
+    var manifest = try xet.recon.planFromShard(allocator, bytes, file_hash);
     defer manifest.deinit(allocator);
     try std.testing.expect(manifest.plan.locations[0].byte_range == null);
     var fetch_context = SliceOpener{ .bytes = object.bytes };
-    const output = try xet.reconstruction.reconstruct(allocator, &manifest.plan, fetch_context.opener());
+    const output = try xet.recon.reconstruct(allocator, &manifest.plan, fetch_context.opener());
     defer allocator.free(output);
     try std.testing.expectEqualStrings("BBB", output);
-    try std.testing.expectEqual(@as(@TypeOf(fetch_context.last_range), null), fetch_context.last_range);
+    try std.testing.expectEqual(
+        @as(@TypeOf(fetch_context.last_range), null),
+        fetch_context.last_range,
+    );
     var open_context = SliceOpener{ .bytes = object.bytes };
     var sink = std.Io.Writer.Allocating.init(allocator);
     defer sink.deinit();
-    const count = try xet.reconstruction.consumeVerified(
+    const count = try xet.recon.consumeVerified(
         allocator,
         &manifest.plan,
         open_context.opener(),
@@ -220,23 +234,34 @@ test "unknown encoded length uses transport and verifies nonzero chunk start" {
     );
     try std.testing.expectEqual(@as(u64, 3), count);
     try std.testing.expectEqualStrings("BBB", sink.written());
-    try std.testing.expectEqual(@as(@TypeOf(open_context.last_range), null), open_context.last_range);
+    try std.testing.expectEqual(
+        @as(@TypeOf(open_context.last_range), null),
+        open_context.last_range,
+    );
     try std.testing.expectEqual(open_context.requests, open_context.closes);
 }
 
-fn checkSha256Extension(shard_bytes: []const u8, file_hash: xet.Hash, expected: *const [32]u8) !void {
+fn checkSha256Extension(
+    shard_bytes: []const u8,
+    file_hash: xet.Hash,
+    expected: *const [32]u8,
+) !void {
     const reader = try xet.shard.Reader.init(shard_bytes);
     const file = (try reader.findFile(file_hash)) orelse return error.TestMissingFile;
     try std.testing.expect(file.flags & xet.shard.metadata_extension_flag != 0);
     const actual = (try file.sha256()) orelse return error.TestMissingSha256;
     const converted = xet.hash.fromStandard(expected.*);
     try std.testing.expectEqualSlices(u8, &converted, &actual);
-    try std.testing.expectEqualSlices(u8, &@as([16]u8, @splat(0)), shard_bytes[file.end - 16 .. file.end]);
+    try std.testing.expectEqualSlices(
+        u8,
+        &@as([16]u8, @splat(0)),
+        shard_bytes[file.end - 16 .. file.end],
+    );
 }
 
 test "empty pack includes the standard SHA-256 metadata digest" {
     const allocator = std.testing.allocator;
-    var package = try xet.pack(allocator, "", .{});
+    var package = try xet.store.pack(allocator, "", .{});
     defer package.deinit(allocator);
     var expected: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash("", &expected, .{});
@@ -248,7 +273,7 @@ test "pack includes independent SHA-256 file metadata" {
     const payload = "known nonempty payload for Git-backed Hub uploads";
     var expected: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(payload, &expected, .{});
-    var package = try xet.pack(allocator, payload, .{});
+    var package = try xet.store.pack(allocator, payload, .{});
     defer package.deinit(allocator);
     try checkSha256Extension(package.shard_bytes, package.file_hash, &expected);
 }
@@ -260,7 +285,7 @@ test "Publisher includes independent SHA-256 file metadata" {
     std.crypto.hash.sha2.Sha256.hash(payload, &expected, .{});
     var destination = support.MemoryStore{ .allocator = allocator };
     defer destination.deinit();
-    var publisher = try xet.StorePublisher.init(allocator, destination.store(), .{});
+    var publisher = try xet.store.Publisher.init(allocator, destination.store(), .{});
     defer publisher.deinit();
     try publisher.write(payload[0..7]);
     try publisher.write(payload[7..23]);
@@ -268,14 +293,18 @@ test "Publisher includes independent SHA-256 file metadata" {
     const result = try publisher.finish();
     try std.testing.expectEqual(@as(usize, 1), destination.count(.shard));
     for (destination.objects.items) |object| {
-        if (object.kind == .shard) try checkSha256Extension(object.data, result.file_hash, &expected);
+        if (object.kind == .shard) try checkSha256Extension(
+            object.data,
+            result.file_hash,
+            &expected,
+        );
     }
 }
 
 test "V2 shard upload accepts progress frames before the result" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var package = try xet.pack(allocator, "AAA", .{ .compression = .none });
+    var package = try xet.store.pack(allocator, "AAA", .{ .compression = .none });
     defer package.deinit(allocator);
     const responses = [_]support.HttpResponse{.{
         .body =
@@ -287,7 +316,7 @@ test "V2 shard upload accepts progress frames before the result" {
     var server = try support.Loopback.init(allocator, io, &responses);
     defer server.deinit();
     try server.start();
-    var client = try xet.http.Client.init(allocator, io, server.origin, "");
+    var client = try xet.Client.init(allocator, io, server.origin, "");
     defer client.deinit();
     try client.putShard(package.shard_bytes);
     try server.finish();
@@ -298,13 +327,13 @@ test "V2 shard upload accepts progress frames before the result" {
 
 test "V2 shard upload accepts a result without a trailing newline" {
     const allocator = std.testing.allocator;
-    var package = try xet.pack(allocator, "AAA", .{ .compression = .none });
+    var package = try xet.store.pack(allocator, "AAA", .{ .compression = .none });
     defer package.deinit(allocator);
     const responses = [_]support.HttpResponse{.{ .body = support.result_json }};
     var server = try support.Loopback.init(allocator, std.testing.io, &responses);
     defer server.deinit();
     try server.start();
-    var client = try xet.http.Client.init(allocator, std.testing.io, server.origin, "");
+    var client = try xet.Client.init(allocator, std.testing.io, server.origin, "");
     defer client.deinit();
     try client.putShard(package.shard_bytes);
     try server.finish();
@@ -312,7 +341,7 @@ test "V2 shard upload accepts a result without a trailing newline" {
 
 test "V2 shard upload ignores frames after the result" {
     const allocator = std.testing.allocator;
-    var package = try xet.pack(allocator, "AAA", .{ .compression = .none });
+    var package = try xet.store.pack(allocator, "AAA", .{ .compression = .none });
     defer package.deinit(allocator);
     const responses = [_]support.HttpResponse{.{
         .body =
@@ -324,7 +353,7 @@ test "V2 shard upload ignores frames after the result" {
     var server = try support.Loopback.init(allocator, std.testing.io, &responses);
     defer server.deinit();
     try server.start();
-    var client = try xet.http.Client.init(allocator, std.testing.io, server.origin, "");
+    var client = try xet.Client.init(allocator, std.testing.io, server.origin, "");
     defer client.deinit();
     try client.putShard(package.shard_bytes);
     try server.finish();
@@ -332,13 +361,13 @@ test "V2 shard upload ignores frames after the result" {
 
 fn expectShardUploadError(response_body: []const u8, expected: anyerror) !void {
     const allocator = std.testing.allocator;
-    var package = try xet.pack(allocator, "AAA", .{ .compression = .none });
+    var package = try xet.store.pack(allocator, "AAA", .{ .compression = .none });
     defer package.deinit(allocator);
     const responses = [_]support.HttpResponse{.{ .body = response_body }};
     var server = try support.Loopback.init(allocator, std.testing.io, &responses);
     defer server.deinit();
     try server.start();
-    var client = try xet.http.Client.init(allocator, std.testing.io, server.origin, "");
+    var client = try xet.Client.init(allocator, std.testing.io, server.origin, "");
     defer client.deinit();
     try std.testing.expectError(expected, client.putShard(package.shard_bytes));
     try server.finish();
@@ -356,13 +385,13 @@ test "V2 shard upload rejects a response without a result" {
 test "V2 shard upload falls back to V1 and caches the choice" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var package = try xet.pack(allocator, "AAA", .{ .compression = .none });
+    var package = try xet.store.pack(allocator, "AAA", .{ .compression = .none });
     defer package.deinit(allocator);
     const responses = [_]support.HttpResponse{ .{ .status = .not_found }, .{}, .{} };
     var server = try support.Loopback.init(allocator, io, &responses);
     defer server.deinit();
     try server.start();
-    var client = try xet.http.Client.init(allocator, io, server.origin, "");
+    var client = try xet.Client.init(allocator, io, server.origin, "");
     defer client.deinit();
     try client.putShard(package.shard_bytes);
     try client.putShard(package.shard_bytes);
@@ -389,7 +418,14 @@ test "publication splits wire shards at 64 MiB without losing metadata or order"
     defer allocator.free(expected_hashes);
     const checks = try allocator.alloc(xet.Hash, count);
     defer allocator.free(checks);
-    for (xorbs, chunks, segments, expected_hashes, checks, 0..) |*object, *chunk, *segment, *expected_hash, *check, index| {
+    for (
+        xorbs,
+        chunks,
+        segments,
+        expected_hashes,
+        checks,
+        0..,
+    ) |*object, *chunk, *segment, *expected_hash, *check, index| {
         const chunk_hash = support.syntheticHash(1, index);
         expected_hash.* = chunk_hash;
         check.* = support.syntheticHash(4, index);
@@ -430,7 +466,7 @@ test "publication splits wire shards at 64 MiB without losing metadata or order"
     try std.testing.expect(shard_bytes.len > 64 * 1024 * 1024);
     const empty_objects = try allocator.alloc(xet.xorb.Serialized, 0);
     defer allocator.free(empty_objects);
-    const package = xet.Package{
+    const package = xet.store.Package{
         .file_hash = files[0].hash,
         .size = count,
         .objects = empty_objects,
@@ -438,7 +474,7 @@ test "publication splits wire shards at 64 MiB without losing metadata or order"
     };
     var destination = support.MemoryStore{ .allocator = allocator };
     defer destination.deinit();
-    try xet.publish(allocator, &package, destination.store());
+    try xet.store.publish(allocator, &package, destination.store());
 
     var lookup: std.ArrayList(xet.shard.XorbInfo) = .empty;
     defer lookup.deinit(allocator);
@@ -488,7 +524,10 @@ test "publication splits wire shards at 64 MiB without losing metadata or order"
             try std.testing.expectEqual(expected_file.sha256, try file.sha256());
             for (0..file.count) |index| {
                 const segment = try file.segment(@intCast(index));
-                try std.testing.expectEqual(expected_file.verification[index], try file.verification(@intCast(index)));
+                try std.testing.expectEqual(
+                    expected_file.verification[index],
+                    try file.verification(@intCast(index)),
+                );
                 var low: usize = 0;
                 var high = lookup.items.len;
                 while (low < high) {
@@ -502,7 +541,10 @@ test "publication splits wire shards at 64 MiB without losing metadata or order"
                         },
                     }
                 }
-                if (low == lookup.items.len or !xet.hash.eql(lookup.items[low].hash, segment.xorb_hash))
+                if (low == lookup.items.len or !xet.hash.eql(
+                    lookup.items[low].hash,
+                    segment.xorb_hash,
+                ))
                     return error.TestMissingPublishedXorb;
                 const info = lookup.items[low];
                 for (segment.chunk_index_start..segment.chunk_index_end) |chunk_index| {
@@ -521,7 +563,9 @@ test "publication splits wire shards at 64 MiB without losing metadata or order"
     for (destination.objects.items) |object| {
         if (object.kind == .shard) {
             const local_reader = try xet.shard.Reader.init(object.data);
-            try std.testing.expect(local_reader.footer.has_file_lookup and local_reader.footer.has_xorb_lookup);
+            try std.testing.expect(
+                local_reader.footer.has_file_lookup and local_reader.footer.has_xorb_lookup,
+            );
             try std.testing.expect(try xet.store.wireShardSize(object.data) <= 64 * 1024 * 1024);
         }
     }
@@ -532,7 +576,10 @@ fn makePartialShard(allocator: std.mem.Allocator, object: *const xet.xorb.Serial
     bytes: []u8,
     file_hash: xet.Hash,
 } {
-    const file_hash = try xet.hash.file(allocator, &.{.{ .hash = xet.hash.data("BBB"), .size = 3 }});
+    const file_hash = try xet.hash.file(
+        allocator,
+        &.{.{ .hash = xet.hash.data("BBB"), .size = 3 }},
+    );
     const checks = [_]xet.Hash{xet.hash.verification(&.{xet.hash.data("BBB")})};
     return .{
         .file_hash = file_hash,
@@ -573,26 +620,32 @@ fn exercisePartialShard(allocator: std.mem.Allocator, comptime streaming: bool) 
     var fixture = try initPartialFixture(allocator);
     defer fixture.object.deinit(allocator);
     defer allocator.free(fixture.shard_bytes);
-    var manifest = try xet.reconstruction.planFromShard(allocator, fixture.shard_bytes, fixture.file_hash);
+    var manifest = try xet.recon.planFromShard(allocator, fixture.shard_bytes, fixture.file_hash);
     defer manifest.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 3), manifest.size);
     try std.testing.expectEqual(@as(usize, 1), manifest.chunks.len);
     try std.testing.expectEqual(xet.hash.data("BBB"), manifest.chunks[0].hash);
     try std.testing.expectEqual(@as(u32, 1), manifest.plan.terms[0].range.start);
     try std.testing.expectEqual(@as(u32, 2), manifest.plan.terms[0].range.end);
-    const expected_range = xet.reconstruction.ByteRange{ .start = 0, .end = @intCast(fixture.object.bytes.len - 1) };
+    const expected_range = xet.recon.ByteRange{
+        .start = 0,
+        .end = @intCast(fixture.object.bytes.len - 1),
+    };
     if (!streaming) {
         var fetch_context = SliceOpener{ .bytes = fixture.object.bytes };
-        const output = try xet.reconstruction.reconstruct(allocator, &manifest.plan, fetch_context.opener());
+        const output = try xet.recon.reconstruct(allocator, &manifest.plan, fetch_context.opener());
         defer allocator.free(output);
         try std.testing.expectEqualStrings("BBB", output);
-        try std.testing.expectEqual(@as(?xet.reconstruction.ByteRange, expected_range), fetch_context.last_range);
+        try std.testing.expectEqual(
+            @as(?xet.recon.ByteRange, expected_range),
+            fetch_context.last_range,
+        );
         return;
     }
     var open_context = SliceOpener{ .bytes = fixture.object.bytes };
     var sink = std.Io.Writer.Allocating.init(allocator);
     defer sink.deinit();
-    const count = try xet.reconstruction.consumeVerified(
+    const count = try xet.recon.consumeVerified(
         allocator,
         &manifest.plan,
         open_context.opener(),
@@ -601,7 +654,7 @@ fn exercisePartialShard(allocator: std.mem.Allocator, comptime streaming: bool) 
     );
     try std.testing.expectEqual(@as(u64, 3), count);
     try std.testing.expectEqualStrings("BBB", sink.written());
-    try std.testing.expectEqual(@as(?xet.reconstruction.ByteRange, expected_range), open_context.last_range);
+    try std.testing.expectEqual(@as(?xet.recon.ByteRange, expected_range), open_context.last_range);
     try std.testing.expectEqual(open_context.requests, open_context.closes);
 }
 
@@ -632,7 +685,11 @@ fn checkUploadedAbcSha256(bytes: []const u8) !void {
     const sha_offset = 48 + 48 * (1 + @as(usize, count) * (1 + verified) + metadata) - 48;
     try std.testing.expect(sha_offset + 48 <= bytes.len);
     try std.testing.expectEqualSlices(u8, &expected_abc_sha256, bytes[sha_offset..][0..32]);
-    try std.testing.expectEqualSlices(u8, &@as([16]u8, @splat(0)), bytes[sha_offset + 32 .. sha_offset + 48]);
+    try std.testing.expectEqualSlices(
+        u8,
+        &@as([16]u8, @splat(0)),
+        bytes[sha_offset + 32 .. sha_offset + 48],
+    );
 }
 
 fn exerciseUploadedSha256(comptime streaming: bool) !void {
@@ -642,19 +699,23 @@ fn exerciseUploadedSha256(comptime streaming: bool) !void {
     var server = try support.Loopback.init(allocator, io, &responses);
     defer server.deinit();
     try server.start();
-    var client = try xet.http.Client.init(allocator, io, server.origin, "");
+    var client = try xet.Client.init(allocator, io, server.origin, "");
     defer client.deinit();
     if (streaming) {
-        var publisher = try xet.StorePublisher.init(allocator, client.store(), .{ .compression = .none });
+        var publisher = try xet.store.Publisher.init(
+            allocator,
+            client.store(),
+            .{ .compression = .none },
+        );
         defer publisher.deinit();
         try publisher.write("a");
         try publisher.write("b");
         try publisher.write("c");
         _ = try publisher.finish();
     } else {
-        var package = try xet.pack(allocator, "abc", .{ .compression = .none });
+        var package = try xet.store.pack(allocator, "abc", .{ .compression = .none });
         defer package.deinit(allocator);
-        try xet.publish(allocator, &package, client.store());
+        try xet.store.publish(allocator, &package, client.store());
     }
     try server.finish();
     try std.testing.expectEqual(@as(usize, 2), server.exchanges.items.len);
@@ -671,7 +732,7 @@ test "streaming Publisher uploads Git SHA-256 in Xet word order" {
 
 test "decoded Git SHA-256 survives shard reserialization" {
     const allocator = std.testing.allocator;
-    var package = try xet.pack(allocator, "abc", .{ .compression = .none });
+    var package = try xet.store.pack(allocator, "abc", .{ .compression = .none });
     defer package.deinit(allocator);
     const reader = try xet.shard.Reader.init(package.shard_bytes);
     const info = (try reader.findFile(package.file_hash)) orelse return error.TestMissingFile;
@@ -692,7 +753,7 @@ test "V2 shard upload requests identity and rejects encoded responses" {
     var server = try support.Loopback.init(allocator, std.testing.io, &responses);
     defer server.deinit();
     try server.start();
-    var client = try xet.http.Client.init(allocator, std.testing.io, server.origin, "");
+    var client = try xet.Client.init(allocator, std.testing.io, server.origin, "");
     defer client.deinit();
     try client.putShard("shard");
     try std.testing.expectError(error.HttpContentEncodingUnsupported, client.putShard("shard"));

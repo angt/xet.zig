@@ -93,7 +93,11 @@ pub const ShardIndex = struct {
         return true;
     }
 
-    pub fn find(self: *const ShardIndex, allocator: std.mem.Allocator, hashes: []const hashing.Hash) !?Match {
+    pub fn find(
+        self: *const ShardIndex,
+        allocator: std.mem.Allocator,
+        hashes: []const hashing.Hash,
+    ) !?Match {
         if (hashes.len == 0) return null;
         var index = self.shards.items.len;
         while (index != 0) {
@@ -199,7 +203,11 @@ pub const SessionIndex = struct {
         }
         self.entries.clearRetainingCapacity();
         for (self.xorbs.items, 0..) |object, xorb_index| {
-            for (object.chunks, 0..) |chunk, chunk_index| self.addEntry(chunk, xorb_index, @intCast(chunk_index));
+            for (object.chunks, 0..) |chunk, chunk_index| self.addEntry(
+                chunk,
+                xorb_index,
+                @intCast(chunk_index),
+            );
         }
     }
 
@@ -241,7 +249,12 @@ fn findInShard(reader: shard.Reader, hashes: []const hashing.Hash) ?Located {
         var best: ?Located = null;
         var lookup = reader.findChunks(target) catch return null;
         while (lookup.next() catch return null) |first| {
-            const located = contiguousRun(reader, first.object, first.index, hashes) orelse return null;
+            const located = contiguousRun(
+                reader,
+                first.object,
+                first.index,
+                hashes,
+            ) orelse return null;
             if (best == null or located.count > best.?.count) best = located;
             if (best.?.count == hashes.len) break;
         }
@@ -264,7 +277,12 @@ fn findInShard(reader: shard.Reader, hashes: []const hashing.Hash) ?Located {
     return best;
 }
 
-fn contiguousRun(reader: shard.Reader, object: shard.XorbInfo, start: u32, hashes: []const hashing.Hash) ?Located {
+fn contiguousRun(
+    reader: shard.Reader,
+    object: shard.XorbInfo,
+    start: u32,
+    hashes: []const hashing.Hash,
+) ?Located {
     var count: u32 = 1;
     while (count < hashes.len and start + count < object.count) : (count += 1) {
         const next = object.chunk(start + count) catch return null;
@@ -297,7 +315,11 @@ test "dedup source rejects invalid matches and releases their nodes" {
 
 test "dedup source rejects overflowing node sizes and releases their nodes" {
     const Context = struct {
-        fn query(_: *anyopaque, allocator: std.mem.Allocator, hashes: []const hashing.Hash) !?Match {
+        fn query(
+            _: *anyopaque,
+            allocator: std.mem.Allocator,
+            hashes: []const hashing.Hash,
+        ) !?Match {
             const nodes = try allocator.alloc(hashing.Node, 2);
             nodes[0] = .{ .hash = hashes[0], .size = std.math.maxInt(u64) };
             nodes[1] = .{ .hash = hashes[1], .size = 1 };
@@ -433,7 +455,11 @@ test "global shard lookup honors HMAC keys and contiguous runs" {
     var metadata: [3]shard.Chunk = undefined;
     var offset: u32 = 0;
     for (&metadata, chunk_hashes) |*entry, hash| {
-        entry.* = .{ .hash = keyed(key, hash), .byte_range_start = offset, .unpacked_segment_bytes = 1 };
+        entry.* = .{
+            .hash = keyed(key, hash),
+            .byte_range_start = offset,
+            .unpacked_segment_bytes = 1,
+        };
         offset += 1;
     }
     const object = shard.Xorb{
@@ -551,7 +577,10 @@ test "ShardIndex rejects oversized input and consumes it on allocation failure" 
     const baseline_size = baseline.len;
     var fail_at: usize = 0;
     while (true) : (fail_at += 1) {
-        var tracker = support.TrackingAllocator{ .backing = std.testing.allocator, .fail_at = fail_at };
+        var tracker = support.TrackingAllocator{
+            .backing = std.testing.allocator,
+            .fail_at = fail_at,
+        };
         defer tracker.deinit();
         const alloc = tracker.allocator();
         const bytes = shard.serialize(alloc, &.{}, &.{metadata}) catch |err| {

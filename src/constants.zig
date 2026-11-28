@@ -1,5 +1,6 @@
 pub const min_chunk_size = 8 * 1024;
 pub const max_chunk_size = 128 * 1024;
+pub const target_xorb_size = 8 * 1024 * 1024;
 pub const max_xorb_size = 64 * 1024 * 1024;
 pub const max_xorb_chunks = 8 * 1024;
 pub const gear_mask: u64 = 0xffff000000000000;

@@ -6,23 +6,21 @@ fn exerciseGlobalAllocationFailure(fail_at: ?usize) !usize {
     const allocator = std.testing.allocator;
     const data = try support.deterministicData(allocator);
     defer allocator.free(data);
-    const chunked = try xet.chunkBuffer(allocator, data);
+    const chunked = try xet.chunker.chunkBuffer(allocator, data);
     defer allocator.free(chunked);
-    const chunks = try allocator.alloc(xet.xorb.Chunk, chunked.len);
-    defer allocator.free(chunks);
-    for (chunks, chunked) |*destination, source| destination.* = .{
-        .data = source.data,
-        .hash = source.hash,
-    };
-    var object = try xet.xorb.serialize(allocator, chunks, .none);
+    var object = try xet.xorb.serialize(allocator, chunked, .none);
     defer object.deinit(allocator);
     const shard_bytes = try support.makeGlobalDedupShard(allocator, &object, null);
-    var index: xet.DedupShardIndex = .{};
+    var index: xet.dedup.ShardIndex = .{};
     defer index.deinit(allocator);
     _ = try index.addOwned(allocator, shard_bytes, 0);
     const Context = struct {
-        index: *xet.DedupShardIndex,
-        fn query(raw: *anyopaque, query_allocator: std.mem.Allocator, hashes: []const xet.Hash) !?xet.DedupMatch {
+        index: *xet.dedup.ShardIndex,
+        fn query(
+            raw: *anyopaque,
+            query_allocator: std.mem.Allocator,
+            hashes: []const xet.Hash,
+        ) !?xet.dedup.Match {
             const self: *@This() = @ptrCast(@alignCast(raw));
             return self.index.find(query_allocator, hashes);
         }
@@ -33,7 +31,7 @@ fn exerciseGlobalAllocationFailure(fail_at: ?usize) !usize {
     var destination = support.MemoryStore{ .allocator = allocator };
     defer destination.deinit();
     _ = {
-        var publisher = try xet.StorePublisher.init(tracker.allocator(), destination.store(), .{
+        var publisher = try xet.store.Publisher.init(tracker.allocator(), destination.store(), .{
             .compression = .none,
             .dedup_source = .{
                 .context = &context,
@@ -74,27 +72,43 @@ test "Client.upload reuses a server-provided global chunk match" {
     var server = try support.Loopback.init(allocator, io, &responses);
     defer server.deinit();
     try server.startGlobalDedup(responses[0].body);
-    var client = try xet.http.Client.init(allocator, io, server.origin, "");
+    var client = try xet.Client.init(allocator, io, server.origin, "");
     defer client.deinit();
-    const result = try client.upload(allocator, "AAA", .{ .compression = .none });
+    const result = try support.uploadBytes(&client, "AAA", .{ .compression = .none });
     try server.finish();
     try std.testing.expectEqual(@as(usize, 2), server.exchanges.items.len);
-    const expected_target = try std.fmt.allocPrint(allocator, "/v1/chunks/default-merkledb/{s}", .{xet.hash.toHex(chunks[0].hash)});
+    const expected_target = try std.fmt.allocPrint(
+        allocator,
+        "/v1/chunks/default-merkledb/{s}",
+        .{xet.hash.toHex(chunks[0].hash)},
+    );
     defer allocator.free(expected_target);
     try std.testing.expectEqualStrings(expected_target, server.exchanges.items[0].target);
-    try std.testing.expectEqualStrings("/v2/shards", server.exchanges.items[server.exchanges.items.len - 1].target);
-    const reader = try xet.shard.Reader.init(server.exchanges.items[server.exchanges.items.len - 1].body);
+    try std.testing.expectEqualStrings(
+        "/v2/shards",
+        server.exchanges.items[server.exchanges.items.len - 1].target,
+    );
+    const reader = try xet.shard.Reader.init(
+        server.exchanges.items[server.exchanges.items.len - 1].body,
+    );
     try std.testing.expectEqual(@as(usize, 0), reader.footer.xorb_count);
     const file = (try reader.findFile(result.file_hash)).?;
     const segment = try file.segment(0);
     try std.testing.expectEqual(object.hash, segment.xorb_hash);
     try std.testing.expectEqual(@as(u32, 0), segment.chunk_index_start);
     try std.testing.expectEqual(@as(u32, 1), segment.chunk_index_end);
-    try std.testing.expectEqual(xet.hash.verification(&.{chunks[0].hash}), try file.verification(0));
+    try std.testing.expectEqual(
+        xet.hash.verification(&.{chunks[0].hash}),
+        try file.verification(0),
+    );
 }
 
-fn uploadRepeatedAbc(client: *xet.http.Client, allocator: std.mem.Allocator, comptime streaming: bool) !xet.store.PublishResult {
-    if (!streaming) return client.upload(allocator, "AAA", .{ .compression = .none });
+fn uploadRepeatedAbc(
+    client: *xet.Client,
+    allocator: std.mem.Allocator,
+    comptime streaming: bool,
+) !xet.store.PublishResult {
+    if (!streaming) return support.uploadBytes(client, "AAA", .{ .compression = .none });
     var session = try client.uploadSession(allocator, .{ .compression = .none });
     defer session.deinit();
     var file = try session.beginFile();
@@ -127,25 +141,34 @@ fn exerciseFreshClientDedup(comptime streaming: bool) !void {
     defer server.deinit();
     try server.start();
 
-    var first = try xet.http.Client.init(allocator, io, server.origin, "");
+    var first = try xet.Client.init(allocator, io, server.origin, "");
     defer first.deinit();
     const first_result = try uploadRepeatedAbc(&first, allocator, streaming);
-    var second = try xet.http.Client.init(allocator, io, server.origin, "");
+    var second = try xet.Client.init(allocator, io, server.origin, "");
     defer second.deinit();
     const second_result = try uploadRepeatedAbc(&second, allocator, streaming);
     try server.finish();
     try std.testing.expectEqual(@as(usize, 5), server.exchanges.items.len);
 
     try std.testing.expectEqual(first_result, second_result);
-    try std.testing.expectEqualStrings("/v1/xorbs/default/" ++ xet.hash.toHex(object.hash), server.exchanges.items[1].target);
+    try std.testing.expectEqualStrings(
+        "/v1/xorbs/default/" ++ xet.hash.toHex(object.hash),
+        server.exchanges.items[1].target,
+    );
     try std.testing.expectEqual(@as(usize, object.body_length), server.exchanges.items[1].body.len);
-    try std.testing.expectEqualStrings("/v1/chunks/default-merkledb/" ++ xet.hash.toHex(chunks[0].hash), server.exchanges.items[3].target);
+    try std.testing.expectEqualStrings(
+        "/v1/chunks/default-merkledb/" ++ xet.hash.toHex(chunks[0].hash),
+        server.exchanges.items[3].target,
+    );
     try std.testing.expectEqual(@as(usize, 0), server.exchanges.items[3].body.len);
     try std.testing.expectEqualStrings("/v2/shards", server.exchanges.items[2].target);
     try std.testing.expectEqualStrings("/v2/shards", server.exchanges.items[4].target);
     const first_bytes = server.exchanges.items[1].body.len + server.exchanges.items[2].body.len;
     try std.testing.expectEqual(@as(u64, @intCast(first_bytes)), first.uploadedBytes());
-    try std.testing.expectEqual(@as(u64, @intCast(server.exchanges.items[4].body.len)), second.uploadedBytes());
+    try std.testing.expectEqual(
+        @as(u64, @intCast(server.exchanges.items[4].body.len)),
+        second.uploadedBytes(),
+    );
     var uploads: usize = 0;
     for (server.exchanges.items) |exchange| {
         if (std.mem.startsWith(u8, exchange.target, "/v1/xorbs/default/")) uploads += 1;
@@ -184,10 +207,10 @@ test "global lookup failures and expired shards fall back to normal uploads" {
     var server = try support.Loopback.init(allocator, io, &responses);
     defer server.deinit();
     try server.start();
-    var client = try xet.http.Client.init(allocator, io, server.origin, "");
+    var client = try xet.Client.init(allocator, io, server.origin, "");
     defer client.deinit();
-    _ = try client.upload(allocator, "AAA", .{ .compression = .none });
-    _ = try client.upload(allocator, "AAA", .{ .compression = .none });
+    _ = try support.uploadBytes(&client, "AAA", .{ .compression = .none });
+    _ = try support.uploadBytes(&client, "AAA", .{ .compression = .none });
     try server.finish();
     try std.testing.expectEqual(@as(usize, 6), server.exchanges.items.len);
     try support.checkXorbBody(server.exchanges.items[1].body);
@@ -199,16 +222,10 @@ test "Client.upload reuses a contiguous run from one global lookup" {
     const io = std.testing.io;
     const data = try support.deterministicData(allocator);
     defer allocator.free(data);
-    const chunked = try xet.chunkBuffer(allocator, data);
+    const chunked = try xet.chunker.chunkBuffer(allocator, data);
     defer allocator.free(chunked);
     try std.testing.expect(chunked.len >= 2);
-    const source_chunks = try allocator.alloc(xet.xorb.Chunk, chunked.len);
-    defer allocator.free(source_chunks);
-    for (source_chunks, chunked) |*destination, source| destination.* = .{
-        .data = source.data,
-        .hash = source.hash,
-    };
-    var object = try xet.xorb.serialize(allocator, source_chunks, .none);
+    var object = try xet.xorb.serialize(allocator, chunked, .none);
     defer object.deinit(allocator);
     var responses = [_]support.HttpResponse{
         .{ .body = try support.makeGlobalDedupShard(allocator, &object, null) },
@@ -221,12 +238,14 @@ test "Client.upload reuses a contiguous run from one global lookup" {
     var server = try support.Loopback.init(allocator, io, &responses);
     defer server.deinit();
     try server.startGlobalDedup(responses[0].body);
-    var client = try xet.http.Client.init(allocator, io, server.origin, "");
+    var client = try xet.Client.init(allocator, io, server.origin, "");
     defer client.deinit();
-    const result = try client.upload(allocator, data, .{ .compression = .none });
+    const result = try support.uploadBytes(&client, data, .{ .compression = .none });
     try server.finish();
     try std.testing.expectEqual(@as(usize, 2), server.exchanges.items.len);
-    const reader = try xet.shard.Reader.init(server.exchanges.items[server.exchanges.items.len - 1].body);
+    const reader = try xet.shard.Reader.init(
+        server.exchanges.items[server.exchanges.items.len - 1].body,
+    );
     try std.testing.expectEqual(@as(usize, 0), reader.footer.xorb_count);
     const file = (try reader.findFile(result.file_hash)).?;
     try std.testing.expectEqual(@as(u32, 1), file.count);
@@ -240,7 +259,7 @@ test "Client.upload mixes global matches with new chunks" {
     const io = std.testing.io;
     const data = try support.deterministicData(allocator);
     defer allocator.free(data);
-    const original_chunks = try xet.chunkBuffer(allocator, data);
+    const original_chunks = try xet.chunker.chunkBuffer(allocator, data);
     defer allocator.free(original_chunks);
     var original_xorbs: std.ArrayList(xet.xorb.Serialized) = .empty;
     defer {
@@ -250,13 +269,7 @@ test "Client.upload mixes global matches with new chunks" {
     var first: usize = 0;
     while (first < original_chunks.len) {
         const end = @min(first + 2, original_chunks.len);
-        const source_chunks = try allocator.alloc(xet.xorb.Chunk, end - first);
-        defer allocator.free(source_chunks);
-        for (source_chunks, original_chunks[first..end]) |*destination, source| destination.* = .{
-            .data = source.data,
-            .hash = source.hash,
-        };
-        const object = try xet.xorb.serialize(allocator, source_chunks, .none);
+        const object = try xet.xorb.serialize(allocator, original_chunks[first..end], .none);
         try original_xorbs.append(allocator, object);
         first = end;
     }
@@ -274,9 +287,13 @@ test "Client.upload mixes global matches with new chunks" {
     var server = try support.Loopback.init(allocator, io, &responses);
     defer server.deinit();
     try server.startGlobalDedup(responses[0].body);
-    var client = try xet.http.Client.init(allocator, io, server.origin, "");
+    var client = try xet.Client.init(allocator, io, server.origin, "");
     defer client.deinit();
-    const result = try client.upload(allocator, data, .{ .compression = .none, .max_xorb_size = 128 * 1024 });
+    const result = try support.uploadBytes(
+        &client,
+        data,
+        .{ .compression = .none, .max_xorb_size = 128 * 1024 },
+    );
     try server.finish();
     try std.testing.expectEqual(@as(usize, 5), server.exchanges.items.len);
     var lookups: usize = 0;
@@ -287,8 +304,13 @@ test "Client.upload mixes global matches with new chunks" {
     }
     try std.testing.expectEqual(@as(usize, 1), lookups);
     try std.testing.expectEqual(@as(usize, 3), uploads);
-    try std.testing.expectEqualStrings("/v2/shards", server.exchanges.items[server.exchanges.items.len - 1].target);
-    const reader = try xet.shard.Reader.init(server.exchanges.items[server.exchanges.items.len - 1].body);
+    try std.testing.expectEqualStrings(
+        "/v2/shards",
+        server.exchanges.items[server.exchanges.items.len - 1].target,
+    );
+    const reader = try xet.shard.Reader.init(
+        server.exchanges.items[server.exchanges.items.len - 1].body,
+    );
     try std.testing.expectEqual(@as(usize, 3), reader.footer.xorb_count);
     const file = (try reader.findFile(result.file_hash)).?;
     try std.testing.expect(file.count >= 2);
@@ -304,9 +326,9 @@ test "Client.upload gates remote misses after the first chunk" {
     var server = try support.Loopback.init(allocator, io, &responses);
     defer server.deinit();
     try server.startGlobalDedup(null);
-    var client = try xet.http.Client.init(allocator, io, server.origin, "");
+    var client = try xet.Client.init(allocator, io, server.origin, "");
     defer client.deinit();
-    _ = try client.upload(allocator, data, .{ .compression = .none });
+    _ = try support.uploadBytes(&client, data, .{ .compression = .none });
     try server.finish();
     var lookups: usize = 0;
     for (server.exchanges.items) |exchange| {

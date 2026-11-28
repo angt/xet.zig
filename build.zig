@@ -3,14 +3,23 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const test_filters = b.option([]const []const u8, "test-filter", "Run only tests matching a filter") orelse &.{};
+    const test_filters = b.option(
+        []const []const u8,
+        "test-filter",
+        "Run only tests matching a filter",
+    ) orelse &.{};
 
-    const xet = b.addModule("xet", .{
+    _ = b.addModule("xet", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
 
+    const xet = b.createModule(.{
+        .root_source_file = b.path("src/test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const support = b.createModule(.{
         .root_source_file = b.path("tests/support.zig"),
         .target = target,

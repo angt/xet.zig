@@ -1,4 +1,4 @@
-//! File reconstruction through caller-provided Xorb retrieval
+//! File recon through caller-provided Xorb retrieval
 
 const std = @import("std");
 const chunker = @import("chunker.zig");
@@ -65,6 +65,17 @@ pub const Plan = struct {
         self.* = undefined;
     }
 
+    /// Stream through a caller-supplied opener. A whole-file plan with a trusted
+    /// file_hash verifies the emitted file before returning success.
+    pub fn write(
+        self: *const Plan,
+        allocator: std.mem.Allocator,
+        opener: Opener,
+        sink: *std.Io.Writer,
+    ) !u64 {
+        return consume(allocator, self, opener, sink);
+    }
+
     pub fn validate(self: *const Plan) !void {
         _ = try self.checkedLength();
     }
@@ -124,7 +135,7 @@ pub fn reconstruct(allocator: std.mem.Allocator, plan: *const Plan, opener: Open
     return output.toOwnedSlice();
 }
 
-/// Streams reconstruction without buffering a complete encoded range or term
+/// Streams recon without buffering a complete encoded range or term
 pub fn consume(
     allocator: std.mem.Allocator,
     plan: *const Plan,
@@ -145,7 +156,13 @@ pub fn consumeWith(
     if (plan.file_hash) |expected| {
         var verifier = verify.Verifier.initWith(allocator, sink, strategy);
         defer verifier.deinit();
-        const written = consumeUnverified(allocator, plan, opener, &verifier.interface, null) catch |err|
+        const written = consumeUnverified(
+            allocator,
+            plan,
+            opener,
+            &verifier.interface,
+            null,
+        ) catch |err|
             return verifier.failure(err);
         try verifier.finish(expected);
         return written;
@@ -168,7 +185,14 @@ pub fn decodeOpenedTermVerified(
     try validateTermChunks(plan.terms[0], expected);
     var verifier = ChunkVerifier{ .allocator = allocator, .expected = expected, .output = sink };
     defer verifier.pending.deinit(allocator);
-    const decoded = decodeTermAt(allocator, plan.terms[0], plan.locations[0], source, &verifier.writer, expected) catch |err|
+    const decoded = decodeTermAt(
+        allocator,
+        plan.terms[0],
+        plan.locations[0],
+        source,
+        &verifier.writer,
+        expected,
+    ) catch |err|
         return verifier.error_value orelse err;
     if (decoded != plan.terms[0].unpacked_length) return error.SizeMismatch;
     if (verifier.index != expected.len or verifier.pending.items.len != 0) return error.SizeMismatch;
@@ -229,10 +253,30 @@ pub fn decodeLocatedTerm(
     source: *std.Io.Reader,
     sink: *std.Io.Writer,
 ) !u64 {
+    return decodeLocatedFrames(allocator, term, location, source, sink, null);
+}
+
+pub fn decodeLocatedFrames(
+    allocator: std.mem.Allocator,
+    term: Term,
+    location: Location,
+    source: *std.Io.Reader,
+    sink: *std.Io.Writer,
+    frames: ?[]hashing.Node,
+) !u64 {
     try validateTermRange(term);
     if (!covers(location, term)) return error.MissingLocation;
     if (!hasUsableRange(location)) return error.InvalidRange;
-    return decodeTermAt(allocator, term, location, source, sink, null);
+    const base = if (location.byte_range == null) 0 else location.range.start;
+    return xorb.decodeFrames(
+        allocator,
+        source,
+        term.range.start - base,
+        term.range.end - base,
+        null,
+        sink,
+        frames,
+    );
 }
 
 fn decodeTermAt(
@@ -273,6 +317,8 @@ fn consumeUnverified(
     chunks: ?[]const ExpectedChunk,
 ) !u64 {
     const wanted = try plan.checkedLength();
+    // An empty range needs no source and leaves skip untouched
+    if (wanted == 0) return 0;
     var skip = plan.offset_into_first_range;
     var written: u64 = 0;
     var next_chunk: usize = 0;
@@ -296,7 +342,14 @@ fn consumeUnverified(
         };
         const count = try termChunkCount(term);
         const term_chunks = takeTermChunks(chunks, &next_chunk, count);
-        const decoded = decodeTermAt(allocator, term, location, source, &context.writer, term_chunks) catch |err| switch (err) {
+        const decoded = decodeTermAt(
+            allocator,
+            term,
+            location,
+            source,
+            &context.writer,
+            term_chunks,
+        ) catch |err| switch (err) {
             error.ReadFailed => return opener.readError(source, err),
             else => return err,
         };
@@ -313,7 +366,11 @@ pub const RangeWriter = struct {
     written: *u64,
     writer: std.Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
 
-    fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+    fn drain(
+        writer: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
         const self: *RangeWriter = @fieldParentPtr("writer", writer);
         for (data[0 .. data.len - 1]) |bytes| try self.write(bytes);
         for (0..splat) |_| try self.write(data[data.len - 1]);
@@ -388,7 +445,10 @@ pub fn validateShardFile(
             )) return error.HashMismatch;
         }
     }
-    if (!hashing.eql(info.hash, try hashing.file(allocator, nodes.items))) return error.HashMismatch;
+    if (!hashing.eql(
+        info.hash,
+        try hashing.file(allocator, nodes.items),
+    )) return error.HashMismatch;
     return info.hash;
 }
 
@@ -409,7 +469,11 @@ pub fn planFromShard(
     var chunk_count: usize = 0;
     for (0..info.count) |index| {
         const segment = try info.segment(@intCast(index));
-        chunk_count = std.math.add(usize, segment.chunk_index_end - segment.chunk_index_start, chunk_count) catch
+        chunk_count = std.math.add(
+            usize,
+            segment.chunk_index_end - segment.chunk_index_start,
+            chunk_count,
+        ) catch
             return error.InvalidShard;
     }
     const chunks = try allocator.alloc(ExpectedChunk, chunk_count);
@@ -438,7 +502,11 @@ pub fn planFromShard(
             chunks[next_chunk] = .{ .hash = chunk.hash, .size = chunk.unpacked_segment_bytes };
             next_chunk += 1;
         }
-        size = std.math.add(u64, size, segment.unpacked_segment_bytes) catch return error.InvalidSize;
+        size = std.math.add(
+            u64,
+            size,
+            segment.unpacked_segment_bytes,
+        ) catch return error.InvalidSize;
     }
     var plan = try Plan.init(allocator, terms, locations);
     errdefer plan.deinit(allocator);
@@ -484,7 +552,11 @@ const ChunkVerifier = struct {
     writer: std.Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
     error_value: ?anyerror = null,
 
-    fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+    fn drain(
+        writer: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
         const self: *ChunkVerifier = @fieldParentPtr("writer", writer);
         for (data[0 .. data.len - 1]) |bytes| {
             self.write(bytes) catch |err| {
@@ -513,7 +585,10 @@ const ChunkVerifier = struct {
             try self.pending.appendSlice(self.allocator, remaining[0..count]);
             remaining = remaining[count..];
             if (self.pending.items.len != expected.size) continue;
-            if (!hashing.eql(hashing.data(self.pending.items), expected.hash)) return error.HashMismatch;
+            if (!hashing.eql(
+                hashing.data(self.pending.items),
+                expected.hash,
+            )) return error.HashMismatch;
             if (self.output) |sink| try sink.writeAll(self.pending.items);
             self.pending.clearRetainingCapacity();
             self.index += 1;
@@ -653,6 +728,101 @@ test "plans reject output ranges beyond their declared contents before I/O" {
     try plan.validate();
 }
 
+test "validated empty ranges write nothing without opening a source" {
+    const hash = hashing.data("object");
+    var terms = [_]Term{.{
+        .hash = hash,
+        .unpacked_length = 1,
+        .range = .{ .start = 0, .end = 1 },
+    }};
+    var locations = [_]Location{.{
+        .hash = hash,
+        .range = .{ .start = 0, .end = 1 },
+        .url = "memory://object",
+        .byte_range = null,
+    }};
+    const Context = struct {
+        calls: usize = 0,
+        reader: std.Io.Reader = .fixed(""),
+        fn open(raw: *anyopaque, _: Request) !*std.Io.Reader {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return &self.reader;
+        }
+        fn close(_: *anyopaque, _: *std.Io.Reader) void {}
+    };
+    var context = Context{};
+    const opener = Opener{
+        .context = &context,
+        .open_fn = Context.open,
+        .close_fn = Context.close,
+    };
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    var plan = Plan{
+        .terms = &terms,
+        .locations = &locations,
+        .offset_into_first_range = 1,
+        .output_length = 0,
+    };
+    try plan.validate();
+    try std.testing.expectEqual(@as(u64, 0), try consume(
+        std.testing.allocator,
+        &plan,
+        opener,
+        &output.writer,
+    ));
+    plan.offset_into_first_range = 0;
+    try plan.validate();
+    try std.testing.expectEqual(@as(u64, 0), try consume(
+        std.testing.allocator,
+        &plan,
+        opener,
+        &output.writer,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), context.calls);
+    try std.testing.expectEqual(@as(usize, 0), output.written().len);
+}
+
+test "whole empty files still verify their file hash" {
+    const Context = struct {
+        calls: usize = 0,
+        reader: std.Io.Reader = .fixed(""),
+        fn open(raw: *anyopaque, _: Request) !*std.Io.Reader {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return &self.reader;
+        }
+        fn close(_: *anyopaque, _: *std.Io.Reader) void {}
+    };
+    var context = Context{};
+    const opener = Opener{
+        .context = &context,
+        .open_fn = Context.open,
+        .close_fn = Context.close,
+    };
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    var plan = Plan{ .terms = &.{}, .locations = &.{}, .file_hash = hashing.zero };
+    try std.testing.expectEqual(@as(u64, 0), try consume(
+        std.testing.allocator,
+        &plan,
+        opener,
+        &output.writer,
+    ));
+    plan.file_hash = hashing.data("not the empty file");
+    try std.testing.expectError(error.HashMismatch, consume(
+        std.testing.allocator,
+        &plan,
+        opener,
+        &output.writer,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), context.calls);
+    try std.testing.expectEqual(@as(usize, 0), output.written().len);
+}
+
 test "location lookup skips inverted ranges even when a valid duplicate follows" {
     const hash = hashing.data("object");
     const term = Term{
@@ -742,12 +912,21 @@ test "repeated terms resolve the covering location and decode its chunk" {
     defer plan.deinit(allocator);
     try plan.validate();
     for (plan.terms) |term|
-        try std.testing.expectEqualStrings("memory://covering", findLocation(plan.locations, term).?.url);
+        try std.testing.expectEqualStrings(
+            "memory://covering",
+            findLocation(plan.locations, term).?.url,
+        );
 
     var source: std.Io.Reader = .fixed(object.bytes);
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    try std.testing.expectEqual(@as(u64, 2), try decodeTerm(allocator, &plan, count - 1, &source, &output.writer));
+    try std.testing.expectEqual(@as(u64, 2), try decodeTerm(
+        allocator,
+        &plan,
+        count - 1,
+        &source,
+        &output.writer,
+    ));
     try std.testing.expectEqualStrings("bb", output.written());
 }
 
@@ -956,7 +1135,9 @@ test "repeated queries decode through the better location listed last" {
             self.range = request.byte_range;
             try std.testing.expectEqualStrings("memory://better", request.url);
             const range = request.byte_range orelse return error.TestMissingRequest;
-            self.reader = .fixed(self.bytes[@intCast(range.start)..][0..@intCast(range.end - range.start + 1)]);
+            self.reader = .fixed(
+                self.bytes[@intCast(range.start)..][0..@intCast(range.end - range.start + 1)],
+            );
             return &self.reader;
         }
         fn close(_: *anyopaque, _: *std.Io.Reader) void {}
@@ -1033,7 +1214,9 @@ test "cycled ranges decode through their own selected location" {
             try std.testing.expectEqual(start, range.start);
             try std.testing.expectEqual(start + 8, range.end);
             self.calls += 1;
-            self.reader = .fixed(self.bytes[@intCast(range.start)..][0..@intCast(range.end - range.start + 1)]);
+            self.reader = .fixed(
+                self.bytes[@intCast(range.start)..][0..@intCast(range.end - range.start + 1)],
+            );
             return &self.reader;
         }
         fn close(_: *anyopaque, _: *std.Io.Reader) void {}
@@ -1071,7 +1254,11 @@ test "location lookup keeps a whole object when a packed range overflows" {
         .url = "memory://overflowing",
         .byte_range = .{ .start = 0, .end = std.math.maxInt(u64) },
     };
-    const term = Term{ .hash = object.hash, .unpacked_length = 3, .range = .{ .start = 0, .end = 1 } };
+    const term = Term{
+        .hash = object.hash,
+        .unpacked_length = 3,
+        .range = .{ .start = 0, .end = 1 },
+    };
     var orders = [_][2]Location{
         .{ whole, overflowing },
         .{ overflowing, whole },
@@ -1108,7 +1295,7 @@ test "location lookup keeps a whole object when a packed range overflows" {
     }
 }
 
-test "reconstruction rejects an overflow-only location before opening or writing" {
+test "recon rejects an overflow-only location before opening or writing" {
     const allocator = std.testing.allocator;
     const hash = hashing.data("object");
     const terms = [_]Term{.{
@@ -1217,7 +1404,13 @@ test "location lookup keeps a range without packed offsets as a fallback" {
     var source: std.Io.Reader = .fixed(object.bytes);
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    try std.testing.expectEqual(@as(u64, 2), try decodeTerm(allocator, &plan, 0, &source, &output.writer));
+    try std.testing.expectEqual(@as(u64, 2), try decodeTerm(
+        allocator,
+        &plan,
+        0,
+        &source,
+        &output.writer,
+    ));
     try std.testing.expectEqualStrings("bb", output.written());
 }
 
@@ -1245,7 +1438,11 @@ test "location lookup ranks candidates by the transport request they serve" {
         .url = "memory://whole",
         .byte_range = null,
     };
-    const term = Term{ .hash = object.hash, .unpacked_length = 1, .range = .{ .start = 5, .end = 6 } };
+    const term = Term{
+        .hash = object.hash,
+        .unpacked_length = 1,
+        .range = .{ .start = 5, .end = 6 },
+    };
     const orders = [_][2]Location{
         .{ bounded, whole },
         .{ whole, bounded },
@@ -1262,7 +1459,9 @@ test "location lookup ranks candidates by the transport request they serve" {
                     .start = 0,
                     .end = @intCast(self.bytes.len - 1),
                 };
-                self.reader = .fixed(self.bytes[@intCast(range.start)..][0..@intCast(range.end - range.start + 1)]);
+                self.reader = .fixed(
+                    self.bytes[@intCast(range.start)..][0..@intCast(range.end - range.start + 1)],
+                );
                 return &self.reader;
             }
             fn close(_: *anyopaque, _: *std.Io.Reader) void {}
@@ -1319,7 +1518,11 @@ test "whole-object locations decode terms from absolute chunk indices" {
         fn close(_: *anyopaque, _: *std.Io.Reader) void {}
     };
     var context = Context{ .bytes = object.bytes };
-    const opener = Opener{ .context = &context, .open_fn = Context.open, .close_fn = Context.close };
+    const opener = Opener{
+        .context = &context,
+        .open_fn = Context.open,
+        .close_fn = Context.close,
+    };
 
     const result = try reconstruct(allocator, &plan, opener);
     defer allocator.free(result);
@@ -1333,7 +1536,7 @@ test "whole-object locations decode terms from absolute chunk indices" {
     try std.testing.expectEqualStrings("bb", verified.written());
 }
 
-test "reconstruction does not emit empty writes" {
+test "recon does not emit empty writes" {
     const allocator = std.testing.allocator;
     const chunks = [_]xorb.Chunk{
         .{ .data = "AAA", .hash = hashing.data("AAA") },
@@ -1368,12 +1571,20 @@ test "reconstruction does not emit empty writes" {
             return &self.reader;
         }
         fn close(_: *anyopaque, _: *std.Io.Reader) void {}
-        fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        fn drain(
+            writer: *std.Io.Writer,
+            data: []const []const u8,
+            splat: usize,
+        ) std.Io.Writer.Error!usize {
             const self: *@This() = @fieldParentPtr("writer", writer);
             const count = std.Io.Writer.countSplat(data, splat);
             if (count == 0) self.empty_writes += 1;
-            for (data[0 .. data.len - 1]) |part| self.output.writer.writeAll(part) catch return error.WriteFailed;
-            for (0..splat) |_| self.output.writer.writeAll(data[data.len - 1]) catch return error.WriteFailed;
+            for (data[0 .. data.len - 1]) |part| self.output.writer.writeAll(
+                part,
+            ) catch return error.WriteFailed;
+            for (0..splat) |_| self.output.writer.writeAll(
+                data[data.len - 1],
+            ) catch return error.WriteFailed;
             return count;
         }
     };
@@ -1399,7 +1610,11 @@ test "shard plans validate Merkle roots and preserve every selected chunk" {
         mutable.deinit(allocator);
     }
     try std.testing.expect(package.objects.len > 1);
-    try std.testing.expectEqual(package.file_hash, try validateShardFile(allocator, package.shard_bytes, null));
+    try std.testing.expectEqual(package.file_hash, try validateShardFile(
+        allocator,
+        package.shard_bytes,
+        null,
+    ));
     var result = try planFromShard(allocator, package.shard_bytes, package.file_hash);
     defer result.deinit(allocator);
     try std.testing.expectEqual(@as(u64, data.len), result.size);
@@ -1416,7 +1631,11 @@ test "shard validation reports a missing file" {
         var mutable = package;
         mutable.deinit(allocator);
     }
-    try std.testing.expectError(error.NotFound, validateShardFile(allocator, package.shard_bytes, hashing.zero));
+    try std.testing.expectError(error.NotFound, validateShardFile(
+        allocator,
+        package.shard_bytes,
+        hashing.zero,
+    ));
 }
 
 test "shard plan for an empty file contains no chunks" {
@@ -1440,7 +1659,11 @@ test "shard validation rejects a corrupted file Merkle root" {
         mutable.deinit(allocator);
     }
     @memset(empty.shard_bytes[shard.header_size..][0..hashing.zero.len], 1);
-    try std.testing.expectError(error.HashMismatch, validateShardFile(allocator, empty.shard_bytes, null));
+    try std.testing.expectError(error.HashMismatch, validateShardFile(
+        allocator,
+        empty.shard_bytes,
+        null,
+    ));
 }
 
 const PackOpener = struct {
@@ -1491,7 +1714,13 @@ test "verified consumption round-trips fixed chunk boundaries" {
     var source = PackOpener{ .objects = package.objects };
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    const count = try consumeVerified(allocator, &manifest.plan, source.opener(), manifest.chunks, &output.writer);
+    const count = try consumeVerified(
+        allocator,
+        &manifest.plan,
+        source.opener(),
+        manifest.chunks,
+        &output.writer,
+    );
     try std.testing.expectEqual(@as(u64, 6), count);
     try std.testing.expectEqualStrings("abcdef", output.written());
 
@@ -1522,7 +1751,13 @@ test "verified consumption rejects an incorrect file root" {
     defer output.deinit();
     try std.testing.expectError(
         error.HashMismatch,
-        consumeVerified(allocator, &manifest.plan, source.opener(), manifest.chunks, &output.writer),
+        consumeVerified(
+            allocator,
+            &manifest.plan,
+            source.opener(),
+            manifest.chunks,
+            &output.writer,
+        ),
     );
     try std.testing.expectEqual(@as(usize, 0), source.opens);
     try std.testing.expectEqual(@as(usize, 0), output.written().len);
@@ -1542,7 +1777,13 @@ test "verified consumption accepts a canonical file" {
     var source = PackOpener{ .objects = package.objects };
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    const count = try consumeVerified(allocator, &manifest.plan, source.opener(), manifest.chunks, &output.writer);
+    const count = try consumeVerified(
+        allocator,
+        &manifest.plan,
+        source.opener(),
+        manifest.chunks,
+        &output.writer,
+    );
     try std.testing.expectEqual(@as(u64, 6), count);
     try std.testing.expectEqualStrings("abcdef", output.written());
 }
@@ -1588,7 +1829,11 @@ test "verified streaming reconstructs fragmented chunks and rejects wrong data" 
     var context = Context{ .bytes = object.bytes };
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    const opener = Opener{ .context = &context, .open_fn = Context.open, .close_fn = Context.close };
+    const opener = Opener{
+        .context = &context,
+        .open_fn = Context.open,
+        .close_fn = Context.close,
+    };
     const count = try consumeVerified(allocator, &plan, opener, &expected, &output.writer);
     try std.testing.expectEqual(@as(u64, first.len + 6), count);
     try std.testing.expectEqualSlices(u8, first, output.written()[0..first.len]);
@@ -1597,17 +1842,35 @@ test "verified streaming reconstructs fragmented chunks and rejects wrong data" 
     var wrong = expected;
     wrong[0].hash = hashing.data("wrong");
     output.clearRetainingCapacity();
-    try std.testing.expectError(error.HashMismatch, consumeVerified(allocator, &plan, opener, &wrong, &output.writer));
+    try std.testing.expectError(error.HashMismatch, consumeVerified(
+        allocator,
+        &plan,
+        opener,
+        &wrong,
+        &output.writer,
+    ));
     try std.testing.expectEqual(@as(usize, 0), output.written().len);
-    try std.testing.expectError(error.HashMismatch, consumeVerified(allocator, &plan, opener, &wrong, null));
+    try std.testing.expectError(error.HashMismatch, consumeVerified(
+        allocator,
+        &plan,
+        opener,
+        &wrong,
+        null,
+    ));
 
     var ranged = try Plan.init(allocator, &terms, &locations);
     defer ranged.deinit(allocator);
     ranged.output_length = 5;
-    try std.testing.expectError(error.UnsupportedRange, consumeVerified(allocator, &ranged, opener, &expected, null));
+    try std.testing.expectError(error.UnsupportedRange, consumeVerified(
+        allocator,
+        &ranged,
+        opener,
+        &expected,
+        null,
+    ));
 }
 
-test "streaming reconstruction honors offsets and closes every source" {
+test "streaming recon honors offsets and closes every source" {
     const allocator = std.testing.allocator;
     const chunks = [_]xorb.Chunk{
         .{ .data = "alpha", .hash = hashing.data("alpha") },
@@ -1649,7 +1912,9 @@ test "streaming reconstruction honors offsets and closes every source" {
         }
     };
     const header_size = 8 + chunks[0].data.len;
-    var context = Context{ .bytes = object.bytes[header_size .. object.bytes.len - 4 - 92 - 40 * chunks.len] };
+    var context = Context{
+        .bytes = object.bytes[header_size .. object.bytes.len - 4 - 92 - 40 * chunks.len],
+    };
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     const count = try consume(allocator, &plan, .{
@@ -1843,12 +2108,24 @@ test "opened term verification rejects empty and inverted term ranges before wri
     fixture.plan.terms[0].range = .{ .start = 1, .end = 1 };
     try std.testing.expectError(
         error.InvalidRange,
-        decodeOpenedTermVerified(allocator, &fixture.plan, fixture.source(), fixture.expected, &output.writer),
+        decodeOpenedTermVerified(
+            allocator,
+            &fixture.plan,
+            fixture.source(),
+            fixture.expected,
+            &output.writer,
+        ),
     );
     fixture.plan.terms[0].range = .{ .start = 2, .end = 1 };
     try std.testing.expectError(
         error.InvalidRange,
-        decodeOpenedTermVerified(allocator, &fixture.plan, fixture.source(), fixture.expected, &output.writer),
+        decodeOpenedTermVerified(
+            allocator,
+            &fixture.plan,
+            fixture.source(),
+            fixture.expected,
+            &output.writer,
+        ),
     );
     try std.testing.expectEqual(@as(usize, 0), output.written().len);
 }
@@ -1862,7 +2139,13 @@ test "opened term verification rejects plan output ranges before writing" {
     defer output.deinit();
     try std.testing.expectError(
         error.UnsupportedRange,
-        decodeOpenedTermVerified(allocator, &fixture.plan, fixture.source(), fixture.expected, &output.writer),
+        decodeOpenedTermVerified(
+            allocator,
+            &fixture.plan,
+            fixture.source(),
+            fixture.expected,
+            &output.writer,
+        ),
     );
     try std.testing.expectEqual(@as(usize, 0), output.written().len);
 }
@@ -1874,15 +2157,30 @@ test "opened term verification rejects plan file hashes before writing" {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
 
-    fixture.plan.file_hash = try hashing.file(allocator, &.{.{ .hash = hashing.data("abcdef"), .size = 6 }});
+    fixture.plan.file_hash = try hashing.file(
+        allocator,
+        &.{.{ .hash = hashing.data("abcdef"), .size = 6 }},
+    );
     try std.testing.expectError(
         error.UnsupportedFileHash,
-        decodeOpenedTermVerified(allocator, &fixture.plan, fixture.source(), fixture.expected, &output.writer),
+        decodeOpenedTermVerified(
+            allocator,
+            &fixture.plan,
+            fixture.source(),
+            fixture.expected,
+            &output.writer,
+        ),
     );
     fixture.plan.file_hash = hashing.data("wrong file");
     try std.testing.expectError(
         error.UnsupportedFileHash,
-        decodeOpenedTermVerified(allocator, &fixture.plan, fixture.source(), fixture.expected, &output.writer),
+        decodeOpenedTermVerified(
+            allocator,
+            &fixture.plan,
+            fixture.source(),
+            fixture.expected,
+            &output.writer,
+        ),
     );
     try std.testing.expectEqual(@as(usize, 0), output.written().len);
 }
@@ -1899,7 +2197,13 @@ test "opened term verification rejects a chunk count the term does not select" {
     defer output.deinit();
     try std.testing.expectError(
         error.SizeMismatch,
-        decodeOpenedTermVerified(allocator, &fixture.plan, fixture.source(), &split, &output.writer),
+        decodeOpenedTermVerified(
+            allocator,
+            &fixture.plan,
+            fixture.source(),
+            &split,
+            &output.writer,
+        ),
     );
     try std.testing.expectEqual(@as(usize, 0), output.written().len);
 }
@@ -1914,12 +2218,24 @@ test "opened term verification rejects expected sizes that disagree with the ter
     const short = [_]ExpectedChunk{.{ .hash = hashing.data("abcde"), .size = 5 }};
     try std.testing.expectError(
         error.SizeMismatch,
-        decodeOpenedTermVerified(allocator, &fixture.plan, fixture.source(), &short, &output.writer),
+        decodeOpenedTermVerified(
+            allocator,
+            &fixture.plan,
+            fixture.source(),
+            &short,
+            &output.writer,
+        ),
     );
     const empty = [_]ExpectedChunk{.{ .hash = hashing.data(""), .size = 0 }};
     try std.testing.expectError(
         error.InvalidChunkSize,
-        decodeOpenedTermVerified(allocator, &fixture.plan, fixture.source(), &empty, &output.writer),
+        decodeOpenedTermVerified(
+            allocator,
+            &fixture.plan,
+            fixture.source(),
+            &empty,
+            &output.writer,
+        ),
     );
     try std.testing.expectEqual(@as(usize, 0), output.written().len);
 }
@@ -1933,7 +2249,13 @@ test "opened term verification rejects a same-size chunk with the wrong hash" {
     defer output.deinit();
     try std.testing.expectError(
         error.HashMismatch,
-        decodeOpenedTermVerified(allocator, &fixture.plan, fixture.source(), &wrong, &output.writer),
+        decodeOpenedTermVerified(
+            allocator,
+            &fixture.plan,
+            fixture.source(),
+            &wrong,
+            &output.writer,
+        ),
     );
     try std.testing.expectEqual(@as(usize, 0), output.written().len);
 }
@@ -1949,7 +2271,13 @@ test "verified decoding rejects chunk splits the encoded records do not use" {
     defer output.deinit();
     try std.testing.expectError(
         error.SizeMismatch,
-        decodeOpenedTermVerified(allocator, &fixture.plan, fixture.source(), fixture.expected, &output.writer),
+        decodeOpenedTermVerified(
+            allocator,
+            &fixture.plan,
+            fixture.source(),
+            fixture.expected,
+            &output.writer,
+        ),
     );
     try std.testing.expectEqual(@as(usize, 0), output.written().len);
 
@@ -1985,9 +2313,18 @@ test "opened term verification streams one-byte reads and repeated writes" {
     const Context = struct {
         bytes: []const u8,
         position: usize = 0,
-        reader: std.Io.Reader = .{ .vtable = &.{ .stream = streamOne }, .buffer = &.{}, .seek = 0, .end = 0 },
+        reader: std.Io.Reader = .{
+            .vtable = &.{ .stream = streamOne },
+            .buffer = &.{},
+            .seek = 0,
+            .end = 0,
+        },
 
-        fn streamOne(reader: *std.Io.Reader, writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        fn streamOne(
+            reader: *std.Io.Reader,
+            writer: *std.Io.Writer,
+            limit: std.Io.Limit,
+        ) std.Io.Reader.StreamError!usize {
             const self: *@This() = @fieldParentPtr("reader", reader);
             if (self.position == self.bytes.len or limit == .nothing) return error.EndOfStream;
             try writer.writeAll(self.bytes[self.position..][0..1]);
@@ -2024,7 +2361,11 @@ test "verified consumption rejects expected chunks the plan does not select" {
         }
         fn close(_: *anyopaque, _: *std.Io.Reader) void {}
     }{};
-    const opener = Opener{ .context = &context, .open_fn = @TypeOf(context).open, .close_fn = @TypeOf(context).close };
+    const opener = Opener{
+        .context = &context,
+        .open_fn = @TypeOf(context).open,
+        .close_fn = @TypeOf(context).close,
+    };
     const split = [_]ExpectedChunk{
         .{ .hash = hashing.data("abc"), .size = 3 },
         .{ .hash = hashing.data("def"), .size = 3 },
